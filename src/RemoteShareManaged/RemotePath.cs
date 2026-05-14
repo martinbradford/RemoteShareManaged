@@ -177,6 +177,25 @@ public sealed class RemotePath : IAsyncDisposable
     /// Wait for a frame whose ZZ-frame type byte matches <paramref name="zzType"/>.
     /// Used during the port 50000 handshake where the ZZ type IS the message ID.
     /// </summary>
+    /// <summary>
+    /// Wait for any frame, returning it regardless of type.
+    /// Used to drain the channel during channel-open handshake processing.
+    /// Returns null if no frame arrives within the timeout.
+    /// </summary>
+    public async ValueTask<ReceivedFrame?> WaitForAnyFrameAsync(
+        TimeSpan timeout, CancellationToken ct = default)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        linked.CancelAfter(timeout);
+        try
+        {
+            await foreach (var frame in _channel.Reader.ReadAllAsync(linked.Token))
+                return frame;
+        }
+        catch (OperationCanceledException) { }
+        return null;
+    }
+
     public async ValueTask<ReceivedFrame?> WaitForZzTypeAsync(
         byte zzType, TimeSpan timeout, CancellationToken ct = default)
     {
