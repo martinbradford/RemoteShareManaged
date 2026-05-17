@@ -46,6 +46,8 @@ public sealed class ScuSession : IAsyncDisposable
     private RemotePath? _audio;
     private RemotePath? _scope;
 
+    private string _addr = string.Empty;  // stored for AudioChannel factory
+
     private uint _seq;          // outgoing ZZ-frame sequence counter, starts at 1
     private byte _catCmdCounter; // dec[9] in type 0x19 CAT send packets (legacy ZZ path)
     private ushort _catPktId;      // FUN SendCatWrite packet ID, increments per write
@@ -109,6 +111,7 @@ public sealed class ScuSession : IAsyncDisposable
             await DisconnectAsync();
 
         _log.LogInformation("Connecting to {Addr}", addr);
+        _addr = addr;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _seq = 0;  // reset sequence counter — first packet will be seq=1
 
@@ -411,6 +414,47 @@ public sealed class ScuSession : IAsyncDisposable
         }
     }
 
+    // ── Port 50002 audio channel open ─────────────────────────────────────────
+
+    /// <summary>
+    /// Activate the RX audio stream on port 50002.
+    /// Mirrors DoCatChannelOpenAsync but for audio (dev=2, UsbAudio).
+    ///
+    /// Confirmed sequence from Yaesu RX-only Wireshark capture:
+    ///   1. PC→SCU:50002  SendAudioConnect (0x0e, MID=0x0104)
+    ///   2. SCU→PC:50002  0x0e ACK (MID=0x0184)
+    ///   3. PC→SCU:50002  SendAudioOpen ×2 (0x26, MID=0x0105) — audio config
+    ///   4. SCU begins sending 0xa2 RX audio ~40ms later
+    /// </summary>
+    internal async Task DoAudioChannelOpenAsync(RemotePath audioPath, CancellationToken ct)
+    {
+        _log.LogDebug("Opening audio channel (port 50002)...");
+
+        audioPath.Send(ZzFrameCodec.BuildSendAudioConnect(NextSeq(), _helloAckNonce));
+
+        var connAck = await audioPath.WaitForZzTypeAsync(0x0e, StepTimeout, ct);
+        if (connAck is null)
+            _log.LogWarning("Audio SendDevPortConnect ACK not received — continuing");
+        else
+            _log.LogDebug("Audio SendDevPortConnect ACK received");
+
+        // Duplicate pair — same content sent twice
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce));
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce));
+
+        // Give the SCU time to start the RX stream (~40ms observed in capture)
+        await Task.Delay(60, ct);
+        _log.LogInformation("Audio channel open");
+    }
+
+    /// <summary>
+    /// Create an AudioChannel wired into this session's address, nonce and
+    /// sequence counter. Call StartAsync() on the returned instance to open
+    /// the audio channel and begin audio flow.
+    /// </summary>
+    public AudioChannel CreateAudioChannel(ILoggerFactory? loggerFactory = null)
+        => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync, loggerFactory);
+
     // ── Steady-state tasks ────────────────────────────────────────────────────
 
     /// <summary>
@@ -461,87 +505,63 @@ public sealed class ScuSession : IAsyncDisposable
     private async Task CatPumpAsync()
     {
         _log.LogDebug("CAT pump started");
-
         try
         {
             await foreach (var frame in _cat!.Frames.ReadAllAsync(_cts.Token))
             {
-                switch (frame.ZzType)
+                // All SCU→PC responses on port 50001 use FUN_10003c30 encoding.
+                // MID = 0x0185 (UsbCat_WriteAns).
+                // The full CAT response string = ASCII bytes at fun[10..] up to ';'.
+                // fun[10:14] holds the first 4 chars (stored as LE uint32 ASCII).
+                // fun[14:] holds the remaining chars including the terminating ';'.
+                //
+                // Packet types seen: 0x1a (FA freq), 0x2a (IF full state),
+                //                    0x1d (FD band/filter), and others.
+                // 0x18 is the continuous broadcast — skip it.
+                if (frame.ZzType == 0x18)
+                    continue;
+
+                var cat = DecodeFunCatResponse(frame.Raw);
+                if (cat is not null)
                 {
-                    // SCU→PC type 0x1e = binary state response to 0x19 poll
-                    case 0x1e when frame.Payload.Length > 13:
-                        {
-                            var data = frame.Payload[13..];
-                            _log.LogDebug("0x1e state: {D}", BitConverter.ToString(data));
-                            var state = DecodeRadioState(data);
-                            if (state?.Mode is not null)
-                                EmitCat($"MD{state.Mode};");
-                            SendPollCmd(PollCmd1);
-                            SendPollCmd(PollCmd2);
-                            break;
-                        }
-
-                    // SCU→PC type 0x19 = spontaneous push
-                    case 0x19 when frame.Payload.Length > 13:
-                        {
-                            var data = frame.Payload[13..];
-                            _log.LogDebug("0x19 push: {D}", BitConverter.ToString(data));
-                            SendPollCmd(PollCmd1);
-                            SendPollCmd(PollCmd2);
-                            break;
-                        }
-
-                    // SCU→PC type 0x17 = mode/signal readback
-                    // Format: dec[13:] = '<counter><field1><field2><sep>$'
-                    // e.g. '301.$', '251.$', '297,$', '303+$'
-                    case 0x17 when frame.Payload.Length > 13:
-                        {
-                            var cat = DecodeCatString(frame.Payload[13..]);
-                            if (cat is not null)
-                            {
-                                _log.LogDebug("0x17 readback: '{Cat}'", cat);
-                                EmitCat(cat);
-                            }
-                            break;
-                        }
-
-                    // SCU→PC type 0x1a = VFO frequency response to 0x15 'CG<' query
-                    case 0x1a when frame.Payload.Length > 13:
-                        {
-                            var payload = frame.Payload[13..];
-                            _log.LogDebug("0x1a freq: {D}", string.Join(' ', payload.Select(b => b.ToString("x2"))));
-                            long? hz = DecodeFrequency1a(payload);
-                            if (hz.HasValue)
-                            {
-                                // Emit as FA CAT response: full 9-digit format
-                                string faCmd = $"FA0{hz.Value:D8};";
-                                _log.LogInformation("Frequency: {Freq} Hz ({Mhz} MHz)",
-                                    hz.Value, hz.Value / 1e6);
-                                EmitCat(faCmd);
-                            }
-                            break;
-                        }
-                        {
-                            var raw = frame.Payload[13..];
-                            _log.LogDebug("0x13: {D}", string.Join(' ', raw.Select(b => b.ToString("x2"))));
-                            break;
-                        }
-
-                    // SCU→PC type 0x16 = frequency/channel data
-                    // dec[13:] = e.g. '210$', '340$'
-                    case 0x16 when frame.Payload.Length > 13:
-                        {
-                            var cat = DecodeCatString(frame.Payload[13..]);
-                            if (cat is not null)
-                                _log.LogDebug("0x16 freq: '{Cat}'", cat);
-                            break;
-                        }
+                    _log.LogDebug("CAT RX: '{Cat}'", cat);
+                    EmitCat(cat);
                 }
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _log.LogError(ex, "CAT pump error"); }
         _log.LogDebug("CAT pump stopped");
+    }
+
+    /// <summary>
+    /// Decode a FUN_10003c30-encoded SCU→PC response on port 50001.
+    /// Returns the full ASCII CAT string (e.g. "FA028500000;" "IF001028500000+000000200000;")
+    /// or null if the packet doesn't contain a valid CAT response.
+    /// </summary>
+    private static string? DecodeFunCatResponse(byte[] raw)
+    {
+        if (raw.Length < 18)
+            return null;  // too short for any valid response
+        // FUN decode
+        byte kl = raw[6], kh = raw[7];
+        var fun = new byte[raw.Length - 8];
+        for (int i = 0; i < fun.Length; i++)
+            fun[i] = (byte)(((~i + 1) & 0xff) ^ raw[8 + i] ^ kl ^ kh);
+
+        // Sanity check: mid should be 0x0185 (UsbCat_WriteAns)
+        if (fun.Length < 14)
+            return null;
+        ushort mid = (ushort)(fun[2] | (fun[3] << 8));
+        if (mid != 0x0185)
+            return null;
+
+        // CAT string starts at fun[10] (first 4 bytes are ASCII chars of prefix)
+        // and runs to the first ';'
+        int end = Array.IndexOf(fun, (byte)';', 10);
+        if (end < 0)
+            return null;
+        return System.Text.Encoding.ASCII.GetString(fun, 10, end - 10 + 1);
     }
 
     private void EmitCat(string cat)
@@ -693,14 +713,20 @@ public sealed class ScuSession : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send a raw Yaesu ASCII CAT command.
-    /// NOTE: The SCU-LAN10 does not support raw ASCII CAT over port 50001.
-    /// This method is a stub — frequency/mode control needs the proprietary
-    /// binary encoding (not yet implemented).
+    /// Send a Yaesu ASCII CAT command to the radio via the SCU-LAN10.
+    /// The command is wrapped in a FUN_10003c30-encoded SendCatWrite packet
+    /// (same encoding used by SetFrequencyAsync and the Yaesu app itself).
+    /// Examples: "FA;" "MD;" "MD0;" "PC;" "SM0;" "TX;" "RX;"
     /// </summary>
     public ValueTask SendCatAsync(string command, CancellationToken ct = default)
     {
-        _log.LogWarning("SendCatAsync('{Cmd}') — raw ASCII CAT not supported by SCU-LAN10 protocol", command);
+        if (!IsConnected || _cat is null)
+            return ValueTask.CompletedTask;
+
+        _log.LogInformation("SendCat: '{Cmd}'", command);
+        _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce,
+                                                  ++_catPktId,
+                                                  System.Text.Encoding.ASCII.GetBytes(command)));
         return ValueTask.CompletedTask;
     }
 

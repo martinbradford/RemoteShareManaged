@@ -625,7 +625,81 @@ public static class ZzFrameCodec
     /// where type == len+4 lo byte (they happen to collide for these packet sizes).
     /// Payload byte[i] = (~i+1 & 0xff) ^ src[i] ^ seq ^ nonceB
     /// </summary>
-    private static byte[] BuildFunFrame(byte typeByte, byte seq, ReadOnlySpan<byte> payload)
+    /// <summary>
+    /// Build a SendDevPortConnect packet for port 50002 (audio).
+    /// Identical structure to the CAT SendDevPortConnect but with dev=2 (UsbAudio)
+    /// and MID=0x0104. Sent once to port 50002; SCU ACKs with 0x0e MID=0x0184.
+    /// Confirmed from Yaesu RX-only capture.
+    /// </summary>
+    public static byte[] BuildSendAudioConnect(byte seq, byte helloAckNonce, ushort dev = 2)
+    {
+        uint sid = (uint)(helloAckNonce ^ 0x08);
+        Span<byte> buf = stackalloc byte[10];
+        BinaryPrimitives_WriteUInt16LE(buf, 0, dev);
+        BinaryPrimitives_WriteUInt16LE(buf, 2, 0x0104);   // MID_UsbAudio_Connect
+        BinaryPrimitives_WriteUInt16LE(buf, 4, 0x0004);   // data length = 4
+        BinaryPrimitives_WriteUInt32LE(buf, 6, sid);
+        return BuildFunFrame(0x0e, seq, buf);
+    }
+
+    /// <summary>
+    /// Build a SendDevPortOpen packet for port 50002 (audio), type 0x26.
+    /// Carries the full audio configuration: format, channels, sample rate,
+    /// buffer sizes and volume. Sent twice (duplicate pair) immediately after
+    /// the SendAudioConnect ACK. The SCU starts sending 0xa2 RX audio ~40ms later.
+    ///
+    /// Confirmed from Yaesu RX-only Wireshark capture (nonce=0x07):
+    ///   fun = 02 00 05 01 1c 00 | 0f 00 00 00 | 43 05 | 01 02 | 80 3e | 00 00
+    ///         01 00 | 00 00 00 00 00 00 00 | d0 07 | d0 07 | 64 64 | 00 00
+    ///
+    /// Data payload (28 bytes after dev/MID/len header):
+    ///   [0:4]   SID (helloAckNonce ^ 0x08)
+    ///   [4:6]   0x43 0x05  — unknown field (capability/codec flags), copy verbatim
+    ///   [6]     0x01       PCM format
+    ///   [7]     0x02       channels (2 = stereo)
+    ///   [8:10]  0x80 0x3e  sample rate LE = 16000 (audio bandwidth)
+    ///   [10:12] 0x00 0x00  unknown
+    ///   [12]    0x01       unknown
+    ///   [13:20] 0x00 * 7   unknown (all zero)
+    ///   [20:22] 0xd0 0x07  2000 LE — recv buffer
+    ///   [22:24] 0xd0 0x07  2000 LE — send buffer
+    ///   [24]    0x64       volume 100
+    ///   [25]    0x64       volume 100
+    ///   [26:28] 0x00 0x00  unknown
+    /// </summary>
+    public static byte[] BuildSendAudioOpen(byte seq, byte helloAckNonce, ushort dev = 2)
+    {
+        uint sid = (uint)(helloAckNonce ^ 0x08);
+        const int dataLen = 28;
+        byte[] buf = new byte[6 + dataLen];  // dev(2)+MID(2)+len(2)+data(28)
+
+        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 0, dev);
+        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 2, 0x0105);    // MID_UsbAudio_Open
+        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 4, dataLen);
+
+        // data[0:4] = SID
+        BinaryPrimitives_WriteUInt32LE(buf.AsSpan(), 6, sid);
+        // data[4:6] = unknown capability field (verbatim from capture)
+        buf[10] = 0x43; buf[11] = 0x05;
+        // data[6] = PCM format, [7] = channels, [8:10] = sample rate 16000 LE
+        buf[12] = 0x01; buf[13] = 0x02;
+        buf[14] = 0x80; buf[15] = 0x3e;
+        // data[10:12] = 0x00 0x00 (unknown)
+        // data[12] = 0x01 (unknown)
+        buf[18] = 0x01;
+        // data[13:20] = 0x00 * 7 (default)
+        // data[20:22] = recv buffer 2000 LE
+        buf[26] = 0xd0; buf[27] = 0x07;
+        // data[22:24] = send buffer 2000 LE
+        buf[28] = 0xd0; buf[29] = 0x07;
+        // data[24:26] = volume 100, 100
+        buf[30] = 0x64; buf[31] = 0x64;
+        // data[26:28] = 0x00 0x00 (default)
+
+        return BuildFunFrame(0x26, seq, buf);
+    }
+
+    internal static byte[] BuildFunFrame(byte typeByte, byte seq, ReadOnlySpan<byte> payload)
     {
         byte nonceB = NonceB(seq);
         byte[] frame = new byte[8 + payload.Length];

@@ -168,7 +168,7 @@ public sealed class RemotePath : IAsyncDisposable
         frame = default;
         if (!ZzFrameCodec.TryDecode(data, out byte zzType, _decodeBuf, out int decodedLen))
             return false;
-        return ReceivedFrame.TryParse(zzType, _decodeBuf, decodedLen, out frame);
+        return ReceivedFrame.TryParse(zzType, _decodeBuf, decodedLen, out frame, data);
     }
 
     // ── Receive helpers ───────────────────────────────────────────────────────
