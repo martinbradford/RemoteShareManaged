@@ -69,9 +69,6 @@ public sealed class AudioChannel : IAsyncDisposable
     // then incremented. Wraps naturally through 0xff.
     private byte _txFrameSeq;
 
-    // RX: last fun[6] seen — for duplicate suppression.
-    private byte _lastRxSeq = 0xff;
-
     public bool IsRunning
     {
         get; private set;
@@ -124,10 +121,10 @@ public sealed class AudioChannel : IAsyncDisposable
         // Buffer duration kept short (200ms) to avoid overflow-discard ticks.
         _rxBuffer = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
         {
-            BufferDuration = TimeSpan.FromMilliseconds(200),
+            BufferDuration = TimeSpan.FromMilliseconds(500),
             DiscardOnBufferOverflow = true,
         };
-        _waveOut = new WaveOutEvent { DesiredLatency = 150 };
+        _waveOut = new WaveOutEvent { DesiredLatency = 300 };
         _waveOut.Init(_rxBuffer);
         _waveOut.Play();
 
@@ -208,23 +205,20 @@ public sealed class AudioChannel : IAsyncDisposable
 
                 byte kl = raw[6], kh = raw[7];
 
-                // Deduplicate on fun[6].
-                // FUN decode formula: fun[i] = (~i+1 & 0xff) ^ raw[8+i] ^ kl ^ kh
-                // For i=6: (~7 & 0xff) = 0xf9
-                byte rxSeq = (byte)(0xf9 ^ raw[14] ^ kl ^ kh);
-                if (rxSeq == _lastRxSeq)
-                    continue;
-                _lastRxSeq = rxSeq;
+                // No deduplication needed.
+                // The SCU sends 4 interleaved copies of each 10ms audio frame.
+                // 4 copies × 10ms PCM = 40ms of audio data per 40ms wall time
+                // = exactly 100% buffer fill rate. Feed all copies directly.
 
                 // FUN-decode the PCM region: fun[32..32+RxPcmBytes]
                 int pcmLen = Math.Min(raw.Length - (8 + FunHdrBytes), RxPcmBytes);
-                if (pcmLen < 2)
+                if (pcmLen < 4)
                     continue;
 
                 byte[] pcm = new byte[pcmLen];
                 for (int i = 0; i < pcmLen; i++)
                 {
-                    int fi = FunHdrBytes + i;  // index within fun[]
+                    int fi = FunHdrBytes + i;
                     pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
                 }
 
