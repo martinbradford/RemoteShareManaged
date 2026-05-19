@@ -50,6 +50,7 @@ public sealed class AudioChannel : IAsyncDisposable
     // ── State ─────────────────────────────────────────────────────────────────
 
     private readonly ILogger<AudioChannel> _log;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly string _addr;
     private readonly byte _helloAckNonce;
     private readonly Func<byte> _nextSeq;
@@ -94,7 +95,8 @@ public sealed class AudioChannel : IAsyncDisposable
         _helloAckNonce = helloAckNonce;
         _nextSeq = nextSeq;
         _channelOpen = channelOpen;
-        _log = (loggerFactory ?? NullLoggerFactory.Instance).CreateLogger<AudioChannel>();
+        _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
+        _log = _loggerFactory.CreateLogger<AudioChannel>();
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -106,8 +108,14 @@ public sealed class AudioChannel : IAsyncDisposable
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _path = new RemotePath(_addr, ScuPorts.Audio,
-                    NullLoggerFactory.Instance.CreateLogger<RemotePath>());
+                    _loggerFactory.CreateLogger<RemotePath>());
         _path.Open();
+
+        // Give the receive loop a moment to start and drain any ICMP errors
+        // that the SCU may have sent at the end of the previous session.
+        // Without this, WSAECONNRESET from a stale ICMP can poison early sends
+        // even with SIO_UDP_CONNRESET disabled on some Windows configurations.
+        await Task.Delay(100, ct);
 
         // RX playback.
         // Declare the buffer at 48 kHz (device native rate) so WaveOutEvent
@@ -139,7 +147,7 @@ public sealed class AudioChannel : IAsyncDisposable
         _rxPumpTask = Task.Run(RxPumpAsync, _cts.Token);
         _txPumpTask = Task.Run(TxPumpAsync, _cts.Token);
 
-        _log.LogInformation("AudioChannel started — 32 kHz stereo 16-bit");
+        _log.LogInformation("AudioChannel started — 16 kHz stereo 16-bit");
         await Task.CompletedTask;
     }
 
@@ -150,8 +158,21 @@ public sealed class AudioChannel : IAsyncDisposable
         IsRunning = false;
         _cts.Cancel();
 
+        // Clear the playback buffer first so WaveOut stops immediately rather
+        // than continuing to play whatever PCM was already queued in it.
+        _rxBuffer?.ClearBuffer();
         _waveIn?.StopRecording();
         _waveOut?.Stop();
+
+        // Close the RemotePath BEFORE waiting for the pump tasks.
+        // RxPumpAsync blocks on _path.Frames.ReadAllAsync(_cts.Token) — cancelling
+        // _cts only unblocks it when the channel reader is waiting. Completing the
+        // channel writer (via CloseAsync) guarantees ReadAllAsync exits immediately.
+        if (_path is not null)
+        {
+            await _path.CloseAsync();
+            _path = null;
+        }
 
         var tasks = new[] { _rxPumpTask, _txPumpTask }
             .Where(t => t is not null).Select(t => t!);
@@ -166,12 +187,6 @@ public sealed class AudioChannel : IAsyncDisposable
         _waveIn?.Dispose();
         _waveIn = null;
         _rxBuffer = null;
-
-        if (_path is not null)
-        {
-            await _path.CloseAsync();
-            _path = null;
-        }
         _log.LogInformation("AudioChannel stopped");
     }
 

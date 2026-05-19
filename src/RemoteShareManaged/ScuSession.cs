@@ -138,13 +138,16 @@ public sealed class ScuSession : IAsyncDisposable
             if (!await DoHandshakeAsync(ct))
                 return false;
 
-            // Now safe to open the data paths
-            _cat = OpenPath(addr, ScuPorts.Cat);
-            _audio = OpenPath(addr, ScuPorts.Audio);
+            // Now safe to open the data paths.
+            // NOTE: Do NOT open _audio here — AudioChannel.StartAsync() opens its own
+            // RemotePath for port 50002. Opening a second socket here causes the SCU to
+            // receive SendAudioConnect from a different local port than the one it should
+            // reply to, and the SCU's ACK goes to the wrong socket. The _audio field is
+            // left null; CleanupPathsAsync handles null entries safely.
             // NOTE: Do NOT open port 50003 (scope) — the SCU sends ICMP Port Unreachable
             // back to our keepalives on that port, which corrupts its session state.
-            // _scope = OpenPath(addr, ScuPorts.Scope);
-            _log.LogDebug("Data paths opened (cat/audio)");
+            _cat = OpenPath(addr, ScuPorts.Cat);
+            _log.LogDebug("Data paths opened (cat)");
 
             // Keepalive can start now (uses port 50000 only during handshake)
             _keepaliveTask = Task.Run(KeepaliveAsync, _cts.Token);
@@ -430,7 +433,23 @@ public sealed class ScuSession : IAsyncDisposable
     {
         _log.LogDebug("Opening audio channel (port 50002)...");
 
-        audioPath.Send(ZzFrameCodec.BuildSendAudioConnect(NextSeq(), _helloAckNonce));
+        // Send SendAudioConnect twice. On Windows, the very first Send() on a newly
+        // opened UdpClient socket is sometimes silently dropped by the kernel before
+        // the socket is fully registered. Sending twice (with a short gap) ensures
+        // the SCU receives at least one copy. The SCU ignores duplicates harmlessly.
+        var connectFrame1 = ZzFrameCodec.BuildSendAudioConnect(NextSeq(), _helloAckNonce);
+        _log.LogDebug("AudioConnect frame 1 ({Len} bytes): {Hex}",
+                      connectFrame1.Length, Convert.ToHexString(connectFrame1));
+        audioPath.Send(connectFrame1);
+        _log.LogDebug("AudioConnect frame 1 sent");
+
+        await Task.Delay(5, ct);
+
+        var connectFrame2 = ZzFrameCodec.BuildSendAudioConnect(NextSeq(), _helloAckNonce);
+        _log.LogDebug("AudioConnect frame 2 ({Len} bytes): {Hex}",
+                      connectFrame2.Length, Convert.ToHexString(connectFrame2));
+        audioPath.Send(connectFrame2);
+        _log.LogDebug("AudioConnect frame 2 sent");
 
         var connAck = await audioPath.WaitForZzTypeAsync(0x0e, StepTimeout, ct);
         if (connAck is null)

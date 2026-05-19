@@ -124,11 +124,11 @@ public sealed class RemotePath : IAsyncDisposable
 
                 // Log raw datagrams — suppress 0x18 flood to Trace level
                 byte pktType = data.Length > 2 ? data[2] : (byte)0;
-                if (pktType == 0x18)
-                    _log.LogTrace("RemotePath:{Port} RX {Len} bytes type=0x18", _port, data.Length);
-                else
-                    _log.LogDebug("RemotePath:{Port} RX {Len} bytes from {Remote} type=0x{Type:x2}",
-                        _port, data.Length, result.RemoteEndPoint, pktType);
+                //if (pktType == 0x18)
+                //    _log.LogTrace("RemotePath:{Port} RX {Len} bytes type=0x18", _port, data.Length);
+                //else
+                //    _log.LogDebug("RemotePath:{Port} RX {Len} bytes from {Remote} type=0x{Type:x2}",
+                //        _port, data.Length, result.RemoteEndPoint, pktType);
 
                 if (!TryDecodeAndParse(data, out ReceivedFrame frame))
                 {
@@ -207,11 +207,11 @@ public sealed class RemotePath : IAsyncDisposable
             {
                 if (frame.ZzType == zzType)
                     return frame;
-                if (frame.ZzType == 0x18)
-                    _log.LogTrace("RemotePath:{Port} waiting for 0x{Expected:x2}, discarding 0x18", _port, zzType);
-                else
-                    _log.LogDebug("RemotePath:{Port} waiting for ZZ=0x{Expected:x2}, discarding ZZ=0x{Got:x2}",
-                        _port, zzType, frame.ZzType);
+                //if (frame.ZzType == 0x18)
+                //    _log.LogTrace("RemotePath:{Port} waiting for 0x{Expected:x2}, discarding 0x18", _port, zzType);
+                //else
+                //    _log.LogDebug("RemotePath:{Port} waiting for ZZ=0x{Expected:x2}, discarding ZZ=0x{Got:x2}",
+                //        _port, zzType, frame.ZzType);
             }
         }
         catch (OperationCanceledException) { }
@@ -233,8 +233,8 @@ public sealed class RemotePath : IAsyncDisposable
             {
                 if (frame.Mid == expected)
                     return frame;
-                _log.LogDebug("RemotePath:{Port} waiting for MID={Expected}, discarding ZZ=0x{ZZ:x2} MID={Got}",
-                    _port, expected, frame.ZzType, frame.Mid);
+                //_log.LogDebug("RemotePath:{Port} waiting for MID={Expected}, discarding ZZ=0x{ZZ:x2} MID={Got}",
+                //    _port, expected, frame.ZzType, frame.Mid);
             }
         }
         catch (OperationCanceledException) { }
@@ -255,8 +255,8 @@ public sealed class RemotePath : IAsyncDisposable
             {
                 if (frame.Mid == a || frame.Mid == b)
                     return frame;
-                _log.LogDebug("RemotePath:{Port} waiting for {A}/{B}, discarding ZZ=0x{ZZ:x2} MID={Got}",
-                    _port, a, b, frame.ZzType, frame.Mid);
+                //_log.LogDebug("RemotePath:{Port} waiting for {A}/{B}, discarding ZZ=0x{ZZ:x2} MID={Got}",
+                //    _port, a, b, frame.ZzType, frame.Mid);
             }
         }
         catch (OperationCanceledException) { }
