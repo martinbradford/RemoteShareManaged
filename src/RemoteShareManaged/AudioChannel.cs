@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -11,13 +12,14 @@ namespace RemoteShareManaged;
 /// <summary>
 /// Full-duplex audio channel over SCU-LAN10 port 50002.
 ///
-/// Wire format (confirmed from Wireshark captures, stereo 32 kHz 16-bit LE):
+/// Wire format (confirmed from Wireshark captures, stereo 16 kHz 16-bit LE):
 ///   RX  SCU→PC  ZZ type 0xa2, FUN MID 0x0185, 32-byte FUN header + 638 bytes PCM
 ///   TX  PC→SCU  ZZ type 0xa6, FUN MID 0x0105, 32-byte FUN header + 642 bytes PCM
 ///
-///   Each 10 ms frame is sent as an exact duplicate pair (WAN loss resilience).
-///   The SCU deduplicates on fun[6] (the FUN-level frame sequence byte).
-///   RX pairs are similarly deduplicated before feeding the audio buffer.
+///   The SCU sends 4 interleaved copies of each 10 ms audio frame for WAN loss
+///   resilience (fun[6] bits 7..2 = frame ID, bits 1..0 = copy index 2/3/0/1).
+///   4 copies × ~10 ms = ~40 ms of unique audio per ~40 ms wall time = 100% fill.
+///   All copies are fed to the playback buffer — no deduplication needed.
 ///
 ///   Stereo layout: L = main receiver / main TX, R = sub-receiver (silent if off).
 ///
@@ -43,9 +45,13 @@ public sealed class AudioChannel : IAsyncDisposable
     public static readonly WaveFormat WireFormat =
         new WaveFormat(rate: 16_000, bits: 16, channels: 2);
 
-    private const int RxPcmBytes = 638;  // PCM payload per RX packet (fun[32:])
-    private const int TxPcmBytes = 642;  // PCM payload per TX packet (fun[32:])
-    private const int FunHdrBytes = 32;   // FUN header size before PCM
+    //private const int RxPcmBytes = 638;  // PCM payload per RX packet (fun[32:])
+    //private const int TxPcmBytes = 642;  // PCM payload per TX packet (fun[32:])
+    //private const int FunHdrBytes = 32;   // FUN header size before PCM
+
+    private const int RxPcmBytes = 640;  // PCM payload per RX packet (fun[24:])
+    private const int TxPcmBytes = 642;  // TX unchanged — needs separate verification  
+    private const int FunHdrBytes = 32;  // FUN header size before PCM (confirmed from frame decode)
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -115,16 +121,22 @@ public sealed class AudioChannel : IAsyncDisposable
         await Task.Delay(100, ct);
 
         // RX playback.
-        // Declare the buffer at 48 kHz (device native rate) so WaveOutEvent
-        // drains at exactly the rate we fill. We upsample 16→48 kHz manually
-        // in RxPumpAsync by repeating each frame 3× before adding to the buffer.
-        // Buffer duration kept short (200ms) to avoid overflow-discard ticks.
-        _rxBuffer = new BufferedWaveProvider(new WaveFormat(48000, 16, 2))
+        //
+        // Declare the buffer at wire rate (16 kHz stereo 16-bit) — identical to
+        // what the Yaesu DLL does.  WaveOutEvent passes this format to Windows MME
+        // which routes it through the kernel-mode resampler (DME / WASAPI shared
+        // mode) to the device's native rate.  This gives significantly higher
+        // quality than any application-level upsampling, and eliminates the
+        // fill/drain rate mismatch that caused underruns with the 48 kHz buffer.
+        //
+        // Buffer sized at 1000 ms + DesiredLatency 500 ms to absorb WAN jitter
+        // (over-the-internet sessions can see occasional 50–100 ms packet gaps).
+        _rxBuffer = new BufferedWaveProvider(WireFormat)
         {
-            BufferDuration = TimeSpan.FromMilliseconds(500),
+            BufferDuration = TimeSpan.FromMilliseconds(1000),
             DiscardOnBufferOverflow = true,
         };
-        _waveOut = new WaveOutEvent { DesiredLatency = 300 };
+        _waveOut = new WaveOutEvent { DesiredLatency = 500 };
         _waveOut.Init(_rxBuffer);
         _waveOut.Play();
 
@@ -189,9 +201,78 @@ public sealed class AudioChannel : IAsyncDisposable
 
     // ── RX pump — SCU→PC audio (type 0xa2) ───────────────────────────────────
 
+    int frameCount = 0;
+
+    //private async Task RxPumpAsync()
+    //{
+    //    _log.LogDebug("RX audio pump started");
+
+    //    // Rent a reusable decode buffer.  RxPcmBytes (638) rounded down to whole
+    //    // stereo frames = 636 bytes.  We never need more than this.
+    //    const int PcmUsable = (RxPcmBytes / 4) * 4;   // 636
+    //    byte[] pcm = ArrayPool<byte>.Shared.Rent(PcmUsable);
+
+    //    try
+    //    {
+    //        await foreach (var frame in _path!.Frames.ReadAllAsync(_cts.Token))
+    //        {
+    //            if (frame.ZzType != 0xa2)
+    //                continue;
+
+    //            var raw = frame.Raw;
+    //            if (raw.Length < 8 + FunHdrBytes + 4)
+    //                continue;
+
+    //            if (frameCount == 0 || frameCount % 500 == 0)
+    //            {
+    //                int dumpLen = Math.Min(raw.Length, 32);
+    //                _log.LogInformation(
+    //                    "RX audio frame #{N}: raw.Length={Len}, limit={Limit}, " +
+    //                    "first 32 bytes: {Hex}",
+    //                    frameCount++, raw.Length,
+    //                    Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable) / 4 * 4,
+    //                    Convert.ToHexString(raw, 0, dumpLen));
+    //            }
+
+
+    //            byte kl = raw[6], kh = raw[7];
+
+    //            // FUN-decode exactly PcmUsable bytes of PCM (whole stereo frames).
+    //            // Starts at raw[8 + FunHdrBytes], i.e. fun index FunHdrBytes.
+    //            int limit = Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable);
+    //            limit = (limit / 4) * 4;   // clamp to whole stereo frames
+    //            if (limit < 4)
+    //                continue;
+
+    //            for (int i = 0; i < limit; i++)
+    //            {
+    //                int fi = FunHdrBytes + i;
+    //                pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
+    //            }
+
+    //            // Feed decoded PCM directly to the buffer at wire rate (16 kHz).
+    //            // WaveOutEvent / Windows MME handles upsampling to device rate.
+    //            // L↔R swap: wire order is [L_lo, L_hi, R_lo, R_hi]; Yaesu assigns
+    //            // main RX to R, sub-RX to L, so swap pairs to put main RX on L.
+    //            SwapAndAdd(pcm, limit);
+    //        }
+    //    }
+    //    catch (OperationCanceledException) { }
+    //    catch (Exception ex) { _log.LogError(ex, "RX audio pump error"); }
+    //    finally { ArrayPool<byte>.Shared.Return(pcm); }
+
+    //    _log.LogDebug("RX audio pump stopped");
+    //}
+
     private async Task RxPumpAsync()
     {
         _log.LogDebug("RX audio pump started");
+
+        //const int PcmUsable = (RxPcmBytes / 4) * 4;   // 636
+        const int PcmUsable = (RxPcmBytes / 4) * 4;  // 640 — already frame-aligned, no truncation needed
+        byte[] pcm = ArrayPool<byte>.Shared.Rent(PcmUsable);
+        int frameCount = 0;
+
         try
         {
             await foreach (var frame in _path!.Frames.ReadAllAsync(_cts.Token))
@@ -200,35 +281,59 @@ public sealed class AudioChannel : IAsyncDisposable
                     continue;
 
                 var raw = frame.Raw;
-                if (raw.Length < 8 + FunHdrBytes + 2)
+                if (raw.Length < 8 + FunHdrBytes + 4)
                     continue;
+
+                // Log the first frame in full, then every 500th
+                if (frameCount == 0 || frameCount % 500 == 0)
+                {
+                    int dumpLen = Math.Min(raw.Length, 32);
+                    _log.LogInformation(
+                        "RX audio frame #{N}: raw.Length={Len}, limit={Limit}, " +
+                        "first 32 bytes: {Hex}",
+                        frameCount, raw.Length,
+                        Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable) / 4 * 4,
+                        Convert.ToHexString(raw, 0, dumpLen));
+                }
+                frameCount++;
 
                 byte kl = raw[6], kh = raw[7];
 
-                // No deduplication needed.
-                // The SCU sends 4 interleaved copies of each 10ms audio frame.
-                // 4 copies × 10ms PCM = 40ms of audio data per 40ms wall time
-                // = exactly 100% buffer fill rate. Feed all copies directly.
-
-                // FUN-decode the PCM region: fun[32..32+RxPcmBytes]
-                int pcmLen = Math.Min(raw.Length - (8 + FunHdrBytes), RxPcmBytes);
-                if (pcmLen < 4)
+                int limit = Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable);
+                limit = (limit / 4) * 4;
+                if (limit < 4)
                     continue;
 
-                byte[] pcm = new byte[pcmLen];
-                for (int i = 0; i < pcmLen; i++)
+                for (int i = 0; i < limit; i++)
                 {
                     int fi = FunHdrBytes + i;
                     pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
                 }
 
-                var upsampled = Upsample16To48(pcm, pcmLen);
-                _rxBuffer!.AddSamples(upsampled, 0, upsampled.Length);
+                SwapAndAdd(pcm, limit);
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _log.LogError(ex, "RX audio pump error"); }
+        finally { ArrayPool<byte>.Shared.Return(pcm); }
+
         _log.LogDebug("RX audio pump stopped");
+    }
+
+    /// <summary>
+    /// Swap L↔R channel pairs in-place then add to <see cref="_rxBuffer"/>.
+    /// Avoids allocating a separate byte[] on every packet.
+    /// </summary>
+    private void SwapAndAdd(byte[] pcm, int len)
+    {
+        // Each stereo frame is 4 bytes: [L_lo, L_hi, R_lo, R_hi]
+        // Swap to [R_lo, R_hi, L_lo, L_hi]
+        for (int i = 0; i < len; i += 4)
+        {
+            (pcm[i], pcm[i + 2]) = (pcm[i + 2], pcm[i]);
+            (pcm[i + 1], pcm[i + 3]) = (pcm[i + 3], pcm[i + 1]);
+        }
+        _rxBuffer!.AddSamples(pcm, 0, len);
     }
 
     // ── TX pump — PC→SCU audio (type 0xa6) ───────────────────────────────────
@@ -360,41 +465,6 @@ public sealed class AudioChannel : IAsyncDisposable
 
         Buffer.BlockCopy(pcm, 0, fun, FunHdrBytes, TxPcmBytes);
         return fun;
-    }
-
-    // ── Resampling ────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Upsample stereo 16 kHz 16-bit PCM to stereo 48 kHz by nearest-neighbour
-    /// (repeat each input frame 3 times). Alias products land at 16/32 kHz,
-    /// well above the HF audio passband, and are filtered by WSJT-X and other
-    /// decoders internally. Signal energy at all in-band frequencies is preserved
-    /// perfectly — unlike linear interpolation which acts as a low-pass filter.
-    /// </summary>
-    private static byte[] Upsample16To48(byte[] src, int srcLen)
-    {
-        srcLen = (srcLen / 4) * 4;  // clamp to whole stereo frames
-        int frames = srcLen / 4;
-        byte[] dst = new byte[frames * 4 * 3];
-        int di = 0;
-        for (int f = 0; f < frames; f++)
-        {
-            byte b0 = src[f * 4], b1 = src[f * 4 + 1], b2 = src[f * 4 + 2], b3 = src[f * 4 + 3];
-            // Swap L↔R to match Yaesu channel assignment (main RX on L, sub RX on R)
-            dst[di++] = b2;
-            dst[di++] = b3;
-            dst[di++] = b0;
-            dst[di++] = b1;
-            dst[di++] = b2;
-            dst[di++] = b3;
-            dst[di++] = b0;
-            dst[di++] = b1;
-            dst[di++] = b2;
-            dst[di++] = b3;
-            dst[di++] = b0;
-            dst[di++] = b1;
-        }
-        return dst;
     }
 
     // ── IAsyncDisposable ──────────────────────────────────────────────────────

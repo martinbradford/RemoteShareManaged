@@ -392,7 +392,68 @@ public sealed class ScuSession : IAsyncDisposable
         _catPktId = pktId;  // save for steady-state SendCatWrite calls
 
         _log.LogInformation("CAT channel open");
+
+        // ── Audio routing initialisation ──────────────────────────────────────
+        // The Yaesu app sends these undocumented commands immediately after the
+        // CAT channel opens. They configure the SCU's audio output routing to
+        // the post-DSP (filtered) path. Without them the SCU delivers unfiltered
+        // audio, so the radio's WIDTH/SHIFT/DSP filter settings have no effect.
+        //
+        // From Yaesu app log at 12:14:32.809–12:14:32.885 (confirmed):
+        //   AI1;JP0101;JP0010;JP0710;ID;   — JP selects filtered audio path
+        //   SPr<0xFF><0xFF><0x13>;ST;TS;VS;FR;  — SP has binary args (undocumented)
+        //   RI0;SS05;SS06;FD000;FD001;     — FD = spectrum display config
+        //   FD002;FD003;IF;MD0;AN0;        — IF/MD/AN = standard CAT queries
+        //
+        // JP and SP are not in the published CAT manual. JP0101/0010/0710 are sent
+        // verbatim; the radio responds JP0101005AFFA52506220808 confirming success.
+        // SP has three non-printable bytes and must be sent as a raw byte array.
+
+        await Task.Delay(15, ct);  // brief gap as observed in Yaesu capture
+
+        // Packet 3: AI1 + JP audio routing commands
+        SendCatWriteRaw(ref pktId,
+            System.Text.Encoding.ASCII.GetBytes("AI1;JP0101;JP0010;JP0710;ID;"));
+
+        await Task.Delay(15, ct);
+
+        // Packet 4: SP (binary args) + standard state queries
+        // SP raw bytes from log: 53 50 72 FF FF 00 (= "SPr" + 0xFF 0xFF 0x13) + ";ST;TS;VS;FR;"
+        // The 0x13 in the log is a control character observed in the raw packet.
+        SendCatWriteRaw(ref pktId, [
+            0x53, 0x50, 0x72, 0xFF, 0xFF, 0x13, 0x3B,  // SPr<0xFF><0xFF><0x13>;
+            .. System.Text.Encoding.ASCII.GetBytes("ST;TS;VS;FR;")
+        ]);
+
+        await Task.Delay(15, ct);
+
+        // Packet 7: spectrum display config + more state
+        SendCatWriteRaw(ref pktId,
+            System.Text.Encoding.ASCII.GetBytes("RI0;SS05;SS06;FD000;FD001;"));
+
+        await Task.Delay(15, ct);
+
+        // Packet 8: remaining spectrum config + standard startup queries
+        SendCatWriteRaw(ref pktId,
+            System.Text.Encoding.ASCII.GetBytes("FD002;FD003;IF;MD0;AN0;"));
+
+        await DrainAny(TimeSpan.FromMilliseconds(200), ct);
+        _catPktId = pktId;
+
+        _log.LogInformation("Audio routing initialised (JP commands sent)");
         return true;
+    }
+
+    /// <summary>
+    /// Send a raw byte payload as a SendCatWrite FUN packet.
+    /// Used for commands with non-printable bytes (e.g. SP command).
+    /// </summary>
+    private void SendCatWriteRaw(ref ushort pktId, byte[] payload)
+    {
+        if (_cat is null)
+            return;
+        _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++pktId, payload));
+        _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++pktId, payload));
     }
 
     /// <summary>Wait for up to <count> packets of <type>, with per-packet timeout.</summary>
