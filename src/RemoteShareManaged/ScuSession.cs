@@ -47,6 +47,7 @@ public sealed class ScuSession : IAsyncDisposable
     private RemotePath? _scope;
 
     private string _addr = string.Empty;  // stored for AudioChannel factory
+    private AudioQuality _audioQuality = AudioQuality.Pcm16k;  // stored for AudioChannel factory
 
     private uint _seq;          // outgoing ZZ-frame sequence counter, starts at 1
     private byte _catCmdCounter; // dec[9] in type 0x19 CAT send packets (legacy ZZ path)
@@ -105,6 +106,7 @@ public sealed class ScuSession : IAsyncDisposable
         string username,
         string password,
         bool isFt710 = false,
+        AudioQuality audioQuality = AudioQuality.Pcm16k,
         CancellationToken ct = default)
     {
         if (IsConnected)
@@ -112,6 +114,7 @@ public sealed class ScuSession : IAsyncDisposable
 
         _log.LogInformation("Connecting to {Addr}", addr);
         _addr = addr;
+        _audioQuality = audioQuality;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _seq = 0;  // reset sequence counter — first packet will be seq=1
 
@@ -519,8 +522,8 @@ public sealed class ScuSession : IAsyncDisposable
             _log.LogDebug("Audio SendDevPortConnect ACK received");
 
         // Duplicate pair — same content sent twice
-        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce));
-        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce));
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
 
         // Give the SCU time to start the RX stream (~40ms observed in capture)
         await Task.Delay(60, ct);
@@ -532,8 +535,9 @@ public sealed class ScuSession : IAsyncDisposable
     /// sequence counter. Call StartAsync() on the returned instance to open
     /// the audio channel and begin audio flow.
     /// </summary>
-    public AudioChannel CreateAudioChannel(ILoggerFactory? loggerFactory = null)
-        => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync, loggerFactory);
+    public AudioChannel CreateAudioChannel(int waveOutDevice = 0, ILoggerFactory? loggerFactory = null)
+        => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync,
+                            _audioQuality, waveOutDevice, loggerFactory);
 
     // ── Steady-state tasks ────────────────────────────────────────────────────
 

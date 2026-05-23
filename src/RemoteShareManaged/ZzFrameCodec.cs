@@ -1,3 +1,4 @@
+using RemoteShareManaged.Protocol;
 using System.Buffers;
 
 namespace RemoteShareManaged.Codec;
@@ -648,53 +649,74 @@ public static class ZzFrameCodec
     /// buffer sizes and volume. Sent twice (duplicate pair) immediately after
     /// the SendAudioConnect ACK. The SCU starts sending 0xa2 RX audio ~40ms later.
     ///
-    /// Confirmed from Yaesu RX-only Wireshark capture (nonce=0x07):
-    ///   fun = 02 00 05 01 1c 00 | 0f 00 00 00 | 43 05 | 01 02 | 80 3e | 00 00
-    ///         01 00 | 00 00 00 00 00 00 00 | d0 07 | d0 07 | 64 64 | 00 00
+    /// Confirmed from four Yaesu Wireshark captures (PCM-16k, PCM-8k, uLaw-16k, uLaw-8k):
     ///
-    /// Data payload (28 bytes after dev/MID/len header):
-    ///   [0:4]   SID (helloAckNonce ^ 0x08)
-    ///   [4:6]   0x43 0x05  — unknown field (capability/codec flags), copy verbatim
-    ///   [6]     0x01       PCM format
-    ///   [7]     0x02       channels (2 = stereo)
-    ///   [8:10]  0x80 0x3e  sample rate LE = 16000 (audio bandwidth)
-    ///   [10:12] 0x00 0x00  unknown
-    ///   [12]    0x01       unknown
-    ///   [13:20] 0x00 * 7   unknown (all zero)
-    ///   [20:22] 0xd0 0x07  2000 LE — recv buffer
-    ///   [22:24] 0xd0 0x07  2000 LE — send buffer
-    ///   [24]    0x64       volume 100
-    ///   [25]    0x64       volume 100
-    ///   [26:28] 0x00 0x00  unknown
+    ///   FUN payload (34 bytes total):
+    ///   fun[0:2]  = 0x0002          len (always 2)
+    ///   fun[2:4]  = 0x0105          MID_UsbAudio_Open
+    ///   fun[4:6]  = 0x001c          data_len (28)
+    ///   fun[6:10] = SID LE          helloAckNonce ^ 0x08
+    ///   fun[10:12]= 0x0000          (zero — NOT 0x0543 as previously documented)
+    ///   fun[12]   = format          0x01=PCM, 0x03=u-Law
+    ///   fun[13]   = 0x02            channels (stereo)
+    ///   fun[14:16]= sampleRate LE   0x3e80=16000, 0x1f40=8000
+    ///   fun[16:18]= 0x0000          unknown
+    ///   fun[18]   = 0x01            unknown fixed byte
+    ///   fun[19:26]= 0x00 * 7        zero padding
+    ///   fun[26:28]= 0x07d0          playback buffer (2000 ms) LE
+    ///   fun[28:30]= 0x07d0          record buffer  (2000 ms) LE
+    ///   fun[30]   = 0x64            volume 100
+    ///   fun[31]   = 0x64            volume 100
+    ///   fun[32:34]= 0x0000          zero
+    ///
+    /// The only fields that vary between modes are fun[12] (format) and fun[14:16] (rate).
+    /// fun[10:12] = 0x0000 confirmed — earlier documentation of 0x0543 was incorrect.
     /// </summary>
-    public static byte[] BuildSendAudioOpen(byte seq, byte helloAckNonce, ushort dev = 2)
+    public static byte[] BuildSendAudioOpen(byte seq, byte helloAckNonce,
+                                             AudioQuality quality = AudioQuality.Pcm16k,
+                                             ushort dev = 2)
     {
         uint sid = (uint)(helloAckNonce ^ 0x08);
         const int dataLen = 28;
         byte[] buf = new byte[6 + dataLen];  // dev(2)+MID(2)+len(2)+data(28)
 
         BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 0, dev);
-        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 2, 0x0105);    // MID_UsbAudio_Open
+        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 2, 0x0105);   // MID_UsbAudio_Open
         BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 4, dataLen);
 
         // data[0:4] = SID
         BinaryPrimitives_WriteUInt32LE(buf.AsSpan(), 6, sid);
-        // data[4:6] = unknown capability field (verbatim from capture)
-        buf[10] = 0x43; buf[11] = 0x05;
-        // data[6] = PCM format, [7] = channels, [8:10] = sample rate 16000 LE
-        buf[12] = 0x01; buf[13] = 0x02;
-        buf[14] = 0x80; buf[15] = 0x3e;
-        // data[10:12] = 0x00 0x00 (unknown)
-        // data[12] = 0x01 (unknown)
+
+        // data[4:6] = 0x0000 (confirmed zero from four captures)
+        // buf[10:12] already zero
+
+        // data[6] = format, [7] = channels, [8:10] = sample rate LE
+        (byte format, ushort sampleRate) = quality switch
+        {
+            AudioQuality.Pcm16k => ((byte)0x01, (ushort)16000),
+            AudioQuality.ULaw16k => ((byte)0x03, (ushort)16000),
+            AudioQuality.Pcm8k => ((byte)0x01, (ushort)8000),
+            AudioQuality.ULaw8k => ((byte)0x03, (ushort)8000),
+            _ => ((byte)0x01, (ushort)16000),
+        };
+        buf[12] = format;
+        buf[13] = 0x02;  // stereo
+        BinaryPrimitives_WriteUInt16LE(buf.AsSpan(), 14, sampleRate);
+
+        // data[10:12] = 0x0000 (already zero)
+        // data[12]    = 0x01   unknown fixed byte
         buf[18] = 0x01;
-        // data[13:20] = 0x00 * 7 (default)
-        // data[20:22] = recv buffer 2000 LE
-        buf[26] = 0xd0; buf[27] = 0x07;
-        // data[22:24] = send buffer 2000 LE
-        buf[28] = 0xd0; buf[29] = 0x07;
+        // data[13:20] = 0x00 * 7 (already zero)
+        // data[20:22] = playback buffer 2000 LE
+        buf[26] = 0xd0;
+        buf[27] = 0x07;
+        // data[22:24] = record buffer 2000 LE
+        buf[28] = 0xd0;
+        buf[29] = 0x07;
         // data[24:26] = volume 100, 100
-        buf[30] = 0x64; buf[31] = 0x64;
-        // data[26:28] = 0x00 0x00 (default)
+        buf[30] = 0x64;
+        buf[31] = 0x64;
+        // data[26:28] = 0x0000 (already zero)
 
         return BuildFunFrame(0x26, seq, buf);
     }

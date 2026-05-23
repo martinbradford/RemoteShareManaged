@@ -12,23 +12,28 @@ namespace RemoteShareManaged;
 /// <summary>
 /// Full-duplex audio channel over SCU-LAN10 port 50002.
 ///
-/// Wire format (confirmed from Wireshark captures, stereo 16 kHz 16-bit LE):
-///   RX  SCU→PC  ZZ type 0xa2, FUN MID 0x0185, 32-byte FUN header + 638 bytes PCM
-///   TX  PC→SCU  ZZ type 0xa6, FUN MID 0x0105, 32-byte FUN header + 642 bytes PCM
+/// Wire format (confirmed from Wireshark captures):
+///   RX  SCU→PC  ZZ type 0xa2, FUN header 24 bytes + 640 bytes audio payload
+///   TX  PC→SCU  ZZ type 0xa6, FUN header 32 bytes + 642 bytes audio payload
 ///
-///   The SCU sends 4 interleaved copies of each 10 ms audio frame for WAN loss
-///   resilience (fun[6] bits 7..2 = frame ID, bits 1..0 = copy index 2/3/0/1).
-///   4 copies × ~10 ms = ~40 ms of unique audio per ~40 ms wall time = 100% fill.
-///   All copies are fed to the playback buffer — no deduplication needed.
+///   Audio quality is selected via <see cref="AudioQuality"/>:
+///     PCM 16 kHz  — 16-bit stereo PCM,  best quality,  ~160 kbps
+///     u-Law 16 kHz — µ-law companded,   natural HF rolloff,  ~80 kbps
+///     PCM 8 kHz   — 16-bit stereo PCM,  half bandwidth
+///     u-Law 8 kHz  — µ-law 8 kHz,       lowest bandwidth, best for slow WAN
 ///
-///   Stereo layout: L = main receiver / main TX, R = sub-receiver (silent if off).
+///   For u-Law modes the RX pump applies NAudio MuLawDecoder before playback.
+///   For 8 kHz modes WireFormat is adjusted to 8000 Hz accordingly.
 ///
+///   The SCU sends 4 interleaved copies of each ~10 ms audio frame for WAN loss
+///   resilience. All copies are fed to the playback buffer — no deduplication needed.
+///
+///   Stereo layout: main RX on L (after L↔R swap), sub-RX on R.
 ///   PTT is handled externally via ScuSession.SendCatAsync("TX;") / "RX;".
-///   TX audio (silence when not transmitting) streams continuously — the SCU
-///   requires an uninterrupted flow in both directions.
 ///
 /// Usage:
-///   var audio = new AudioChannel(addr, helloAckNonce, () => nextSeq(), loggerFactory);
+///   var audio = new AudioChannel(addr, nonce, () => nextSeq(), channelOpen,
+///                                quality: AudioQuality.Pcm16k, loggerFactory);
 ///   await audio.StartAsync();
 ///   // ...
 ///   await audio.StopAsync();
@@ -37,21 +42,25 @@ public sealed class AudioChannel : IAsyncDisposable
 {
     // ── Wire format constants (confirmed from captures) ───────────────────────
 
-    /// <summary>NAudio WaveFormat matching the SCU-LAN10 audio stream.</summary>
-    /// Stereo 16 kHz 16-bit signed LE (Yaesu "PCM 16kHz" setting).
-    /// Packets arrive as identical duplicate pairs; only one of each pair
-    /// is fed to the audio buffer (deduplication on fun[6]).
-    /// 100 unique packets/sec × 638 bytes = 63,800 bytes/sec ≈ 16,000 × 4.
-    public static readonly WaveFormat WireFormat =
-        new WaveFormat(rate: 16_000, bits: 16, channels: 2);
+    /// <summary>NAudio WaveFormat for the current audio quality setting.</summary>
+    public WaveFormat WireFormat => _quality switch
+    {
+        AudioQuality.Pcm8k  or AudioQuality.ULaw8k  => new WaveFormat(8_000,  16, 2),
+        _                                             => new WaveFormat(16_000, 16, 2),
+    };
 
-    //private const int RxPcmBytes = 638;  // PCM payload per RX packet (fun[32:])
-    //private const int TxPcmBytes = 642;  // PCM payload per TX packet (fun[32:])
-    //private const int FunHdrBytes = 32;   // FUN header size before PCM
+    /// <summary>True when the current quality uses µ-law encoding.</summary>
+    private bool IsULaw => _quality is AudioQuality.ULaw16k or AudioQuality.ULaw8k;
 
-    private const int RxPcmBytes = 640;  // PCM payload per RX packet (fun[24:])
-    private const int TxPcmBytes = 642;  // TX unchanged — needs separate verification  
-    private const int FunHdrBytes = 32;  // FUN header size before PCM (confirmed from frame decode)
+    private const int RxPcmBytes  = 640;   // audio payload per RX packet
+    private const int TxPcmBytes  = 642;   // TX payload — needs separate verification
+
+    // RX FUN header size before audio payload.
+    // Confirmed from Wireshark for both PCM and u-Law modes:
+    //   fun[28:30] = 0x0280 (640) — audio payload length field
+    //   8 + 30 + 640 = 678 = raw packet length exactly
+    // Both PCM and u-Law modes use the same 30-byte header.
+    private const int FunHdrBytes = 30;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -61,6 +70,8 @@ public sealed class AudioChannel : IAsyncDisposable
     private readonly byte _helloAckNonce;
     private readonly Func<byte> _nextSeq;
     private readonly Func<RemotePath, CancellationToken, Task> _channelOpen;
+    private readonly AudioQuality _quality;
+    private readonly int _waveOutDevice;
 
     private RemotePath? _path;
     private WaveOutEvent? _waveOut;
@@ -92,12 +103,16 @@ public sealed class AudioChannel : IAsyncDisposable
         byte helloAckNonce,
         Func<byte> nextSeq,
         Func<RemotePath, CancellationToken, Task> channelOpen,
+        AudioQuality quality = AudioQuality.Pcm16k,
+        int waveOutDevice = 0,
         ILoggerFactory? loggerFactory = null)
     {
         _addr = addr;
         _helloAckNonce = helloAckNonce;
         _nextSeq = nextSeq;
         _channelOpen = channelOpen;
+        _quality = quality;
+        _waveOutDevice = waveOutDevice;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _log = _loggerFactory.CreateLogger<AudioChannel>();
     }
@@ -136,7 +151,7 @@ public sealed class AudioChannel : IAsyncDisposable
             BufferDuration = TimeSpan.FromMilliseconds(1000),
             DiscardOnBufferOverflow = true,
         };
-        _waveOut = new WaveOutEvent { DesiredLatency = 500 };
+        _waveOut = new WaveOutEvent { DesiredLatency = 500, DeviceNumber = _waveOutDevice };
         _waveOut.Init(_rxBuffer);
         _waveOut.Play();
 
@@ -156,7 +171,8 @@ public sealed class AudioChannel : IAsyncDisposable
         _rxPumpTask = Task.Run(RxPumpAsync, _cts.Token);
         _txPumpTask = Task.Run(TxPumpAsync, _cts.Token);
 
-        _log.LogInformation("AudioChannel started — 16 kHz stereo 16-bit");
+        _log.LogInformation("AudioChannel started — {Quality} ({Rate} Hz stereo 16-bit)",
+            _quality, WireFormat.SampleRate);
         await Task.CompletedTask;
     }
 
@@ -201,77 +217,15 @@ public sealed class AudioChannel : IAsyncDisposable
 
     // ── RX pump — SCU→PC audio (type 0xa2) ───────────────────────────────────
 
-    int frameCount = 0;
-
-    //private async Task RxPumpAsync()
-    //{
-    //    _log.LogDebug("RX audio pump started");
-
-    //    // Rent a reusable decode buffer.  RxPcmBytes (638) rounded down to whole
-    //    // stereo frames = 636 bytes.  We never need more than this.
-    //    const int PcmUsable = (RxPcmBytes / 4) * 4;   // 636
-    //    byte[] pcm = ArrayPool<byte>.Shared.Rent(PcmUsable);
-
-    //    try
-    //    {
-    //        await foreach (var frame in _path!.Frames.ReadAllAsync(_cts.Token))
-    //        {
-    //            if (frame.ZzType != 0xa2)
-    //                continue;
-
-    //            var raw = frame.Raw;
-    //            if (raw.Length < 8 + FunHdrBytes + 4)
-    //                continue;
-
-    //            if (frameCount == 0 || frameCount % 500 == 0)
-    //            {
-    //                int dumpLen = Math.Min(raw.Length, 32);
-    //                _log.LogInformation(
-    //                    "RX audio frame #{N}: raw.Length={Len}, limit={Limit}, " +
-    //                    "first 32 bytes: {Hex}",
-    //                    frameCount++, raw.Length,
-    //                    Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable) / 4 * 4,
-    //                    Convert.ToHexString(raw, 0, dumpLen));
-    //            }
-
-
-    //            byte kl = raw[6], kh = raw[7];
-
-    //            // FUN-decode exactly PcmUsable bytes of PCM (whole stereo frames).
-    //            // Starts at raw[8 + FunHdrBytes], i.e. fun index FunHdrBytes.
-    //            int limit = Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable);
-    //            limit = (limit / 4) * 4;   // clamp to whole stereo frames
-    //            if (limit < 4)
-    //                continue;
-
-    //            for (int i = 0; i < limit; i++)
-    //            {
-    //                int fi = FunHdrBytes + i;
-    //                pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
-    //            }
-
-    //            // Feed decoded PCM directly to the buffer at wire rate (16 kHz).
-    //            // WaveOutEvent / Windows MME handles upsampling to device rate.
-    //            // L↔R swap: wire order is [L_lo, L_hi, R_lo, R_hi]; Yaesu assigns
-    //            // main RX to R, sub-RX to L, so swap pairs to put main RX on L.
-    //            SwapAndAdd(pcm, limit);
-    //        }
-    //    }
-    //    catch (OperationCanceledException) { }
-    //    catch (Exception ex) { _log.LogError(ex, "RX audio pump error"); }
-    //    finally { ArrayPool<byte>.Shared.Return(pcm); }
-
-    //    _log.LogDebug("RX audio pump stopped");
-    //}
-
     private async Task RxPumpAsync()
     {
         _log.LogDebug("RX audio pump started");
 
-        //const int PcmUsable = (RxPcmBytes / 4) * 4;   // 636
-        const int PcmUsable = (RxPcmBytes / 4) * 4;  // 640 — already frame-aligned, no truncation needed
-        byte[] pcm = ArrayPool<byte>.Shared.Rent(PcmUsable);
-        int frameCount = 0;
+        // For u-Law modes: each wire byte is one µ-law sample which expands to
+        // a 16-bit PCM sample, so the output buffer is 2× the input size.
+        const int PcmUsable = (RxPcmBytes / 4) * 4;  // 640 — frame-aligned
+        int pcmBufSize = IsULaw ? PcmUsable * 2 : PcmUsable;
+        byte[] pcm = ArrayPool<byte>.Shared.Rent(pcmBufSize);
 
         try
         {
@@ -284,19 +238,6 @@ public sealed class AudioChannel : IAsyncDisposable
                 if (raw.Length < 8 + FunHdrBytes + 4)
                     continue;
 
-                // Log the first frame in full, then every 500th
-                if (frameCount == 0 || frameCount % 500 == 0)
-                {
-                    int dumpLen = Math.Min(raw.Length, 32);
-                    _log.LogInformation(
-                        "RX audio frame #{N}: raw.Length={Len}, limit={Limit}, " +
-                        "first 32 bytes: {Hex}",
-                        frameCount, raw.Length,
-                        Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable) / 4 * 4,
-                        Convert.ToHexString(raw, 0, dumpLen));
-                }
-                frameCount++;
-
                 byte kl = raw[6], kh = raw[7];
 
                 int limit = Math.Min(raw.Length - (8 + FunHdrBytes), PcmUsable);
@@ -304,13 +245,31 @@ public sealed class AudioChannel : IAsyncDisposable
                 if (limit < 4)
                     continue;
 
+                // FUN-decode audio payload into pcm[]
                 for (int i = 0; i < limit; i++)
                 {
                     int fi = FunHdrBytes + i;
                     pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
                 }
 
-                SwapAndAdd(pcm, limit);
+                if (IsULaw)
+                {
+                    // µ-law: each decoded byte is one sample — expand to 16-bit PCM.
+                    // Decode backwards so we can expand in-place without a second buffer.
+                    // Wire stereo: [L_ulaw, R_ulaw, ...] → [L_lo, L_hi, R_lo, R_hi, ...]
+                    int outLen = limit * 2;
+                    for (int i = limit - 1; i >= 0; i--)
+                    {
+                        short s = NAudio.Codecs.MuLawDecoder.MuLawToLinearSample(pcm[i]);
+                        pcm[i * 2]     = (byte)(s & 0xFF);
+                        pcm[i * 2 + 1] = (byte)(s >> 8);
+                    }
+                    SwapAndAdd(pcm, outLen);
+                }
+                else
+                {
+                    SwapAndAdd(pcm, limit);
+                }
             }
         }
         catch (OperationCanceledException) { }
