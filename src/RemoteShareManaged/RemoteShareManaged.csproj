@@ -23,4 +23,10 @@
     <PackageReference Include="xunit.extensibility.core" Version="2.9.3" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Reference Include="NAudio">
+      <HintPath>..\SCULAN10Remote\NAudio.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
 </Project>
