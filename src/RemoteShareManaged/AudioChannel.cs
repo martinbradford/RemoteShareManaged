@@ -12,73 +12,67 @@ namespace RemoteShareManaged;
 /// <summary>
 /// Full-duplex audio channel over SCU-LAN10 port 50002.
 ///
-/// Wire format — confirmed from Wireshark captures across all four quality modes:
+/// Wire format confirmed from Wireshark and RemoteShare.dll decompilation:
 ///
 ///   16 kHz modes (PCM 16k, µ-Law 16k):
-///     RX  SCU→PC  ZZ type 0xa2, 30-byte FUN header + 640 bytes 16-bit stereo PCM
-///     TX  PC→SCU  ZZ type 0xa6, 30-byte FUN header + 642 bytes PCM
-///     Packet size: 678 bytes RX / 682 bytes TX,  ~200 pkts/sec
+///     RX  SCU→PC  ZZ type 0xa2, 30-byte FUN header + 640 bytes raw 16-bit stereo PCM
+///     TX  PC→SCU  ZZ type 0xa6, 30-byte FUN header + 642 bytes audio
+///     Packet size: 678 bytes RX / 682 bytes TX
 ///
 ///   8 kHz modes (PCM 8k, µ-Law 8k):
-///     RX  SCU→PC  ZZ type 0xc2, 30-byte FUN header + 160 bytes 16-bit stereo PCM
-///     TX  PC→SCU  ZZ type 0xc6, 32-byte FUN header + 160 bytes audio
-///     Packet size: 198 bytes RX / 202 bytes TX,  ~200 pkts/sec
+///     RX  SCU→PC  ZZ type 0xc2, 30-byte FUN header + 160 bytes audio
+///     TX  PC→SCU  ZZ type 0xc6, 34-byte FUN header + 160 bytes audio
+///     Packet size: 198 bytes RX / 202 bytes TX
 ///
-///   IMPORTANT: the SCU always sends 16-bit stereo PCM in the RX audio payload
-///   regardless of whether µ-Law was requested. The codec byte in SendAudioOpen
-///   is honoured only in the TX header format field — it does not affect RX.
+/// RX encoding by mode (confirmed from Wireshark byte-level analysis):
 ///
-///   MODE SWITCHING: Simply sending SendAudioOpen with 8k parameters is not
-///   sufficient. The SCU switches to 0xc2 mode only after receiving the first
-///   0xc6 TX audio packet. Therefore AudioChannel sends a silent 0xc6 frame
-///   immediately after SendAudioOpen for 8k modes to trigger the switch.
+///   16k PCM:   640 bytes raw 16-bit stereo PCM
+///   16k µ-Law: 640 bytes raw 16-bit stereo PCM (SCU ignores µ-Law at 16k)
+///   8k PCM:    160 bytes raw 16-bit stereo PCM (assumed; treated same as 16k)
+///   8k µ-Law:  160 bytes Yaesu µ-Law stereo pairs [L_ulaw, R_ulaw] × 80 frames
+///              L=main RX audio, R=0xff (µ-Law silence). Decode via YaesuMuLaw.
 ///
-///   Audio payload length is read from fun[28:30] in each RX packet dynamically.
+/// TX encoding (from RemoteShare.dll FUN_10003eb0):
+///   PCM modes:   raw 16-bit stereo PCM
+///   µ-Law modes: Yaesu-custom µ-Law (NOT G.711) — 320 bytes PCM → 160 wire bytes
 ///
-///   The SCU sends 2 duplicate copies of each ~10 ms audio frame for WAN loss
-///   resilience. All copies are fed to the playback buffer — no deduplication
-///   needed.
+/// 8k DEDUPLICATION:
+///   SCU sends 2 copies per frame ~1ms apart. At 8kHz that 1ms gap ≈ 8 samples,
+///   producing a comb filter with nulls at ~1000 Hz — fatal for FT8 decoding.
+///   8k RX pump deduplicates using fun[6:8] as frame ID.
+///   16k modes feed both copies (confirmed working, comb not audible at 16kHz).
 ///
-///   Stereo layout: main RX on L (after L↔R swap), sub-RX on R.
-///   PTT is handled externally via ScuSession.SendCatAsync("TX;") / "RX;".
+/// 0xc6 TX header (34 bytes):
+///   fun[6:10]  = SID (helloAckNonce^0x08) in ALL frames
+///   fun[11]    = 0x43
+///   fun[32:34] = audio_len LE (160)
+///   fun[34+]   = audio data
 ///
-/// Usage:
-///   var audio = new AudioChannel(addr, nonce, () => nextSeq(), channelOpen,
-///                                quality: AudioQuality.Pcm16k, loggerFactory);
-///   await audio.StartAsync();
-///   // ...
-///   await audio.StopAsync();
+/// Stereo layout: main RX on L (after L↔R swap), sub-RX on R.
+/// PTT: ScuSession.SendCatAsync("TX;") / "RX;".
 /// </summary>
 public sealed class AudioChannel : IAsyncDisposable
 {
     // ── Wire format constants ─────────────────────────────────────────────────
 
-    // FUN header size before audio payload — confirmed 30 bytes for all modes.
-    // Exception: 0xc6 TX uses 32-byte header (audio starts at fun[32]).
     private const int FunHdrBytesRx = 30;
     private const int FunHdrBytesTx16k = 30;
-    private const int FunHdrBytesTx8k = 32;
+    private const int FunHdrBytesTx8k = 34;
 
-    // ZZ type bytes
     private const byte RxType16k = 0xa2;
     private const byte TxType16k = 0xa6;
     private const byte RxType8k = 0xc2;
     private const byte TxType8k = 0xc6;
 
-    // TX audio payload sizes (confirmed from Wireshark)
-    private const int TxPcmBytes16k = 642;
-    private const int TxPcmBytes8k = 160;
+    private const int TxWireBytes16k = 642;
+    private const int TxWireBytes8k = 160;
 
-    // Max RX audio payload (640 bytes for 16k)
+    private const int MaxRxWireBytes = 640;
     private const int MaxRxPcmBytes = 640;
 
     private bool Is8k => _quality is AudioQuality.Pcm8k or AudioQuality.ULaw8k;
+    private bool IsULaw => _quality is AudioQuality.ULaw16k or AudioQuality.ULaw8k;
 
-    /// <summary>
-    /// NAudio WaveFormat for RX audio playback.
-    /// The SCU always sends 16-bit stereo PCM. Sample rate is 16000 or 8000 Hz
-    /// depending on AudioQuality.
-    /// </summary>
     public WaveFormat WireFormat => Is8k
         ? new WaveFormat(8_000, 16, 2)
         : new WaveFormat(16_000, 16, 2);
@@ -143,7 +137,6 @@ public sealed class AudioChannel : IAsyncDisposable
                     _loggerFactory.CreateLogger<RemotePath>());
         _path.Open();
 
-        // Give the receive loop a moment to start and drain any stale ICMP errors.
         await Task.Delay(100, ct);
 
         var wireFormat = WireFormat;
@@ -163,27 +156,22 @@ public sealed class AudioChannel : IAsyncDisposable
         };
 
         IsRunning = true;
-
-        // Run the port 50002 handshake (SendAudioConnect + SendAudioOpen).
         await _channelOpen(_path, _cts.Token);
 
-        // For 8k modes the SCU only switches from 0xa2→0xc2 RX after receiving
-        // the first 0xc6 TX packet. Send a silent trigger frame now.
         if (Is8k)
         {
-            byte[] silence = new byte[TxPcmBytes8k];  // all zeros = silence
+            byte[] silence = new byte[TxWireBytes8k];
             byte[] trigger = BuildTxFunPayload(silence);
             _path.Send(ZzFrameCodec.BuildFunFrame(TxType8k, _nextSeq(), trigger));
             _path.Send(ZzFrameCodec.BuildFunFrame(TxType8k, _nextSeq(), trigger));
             _txFrameSeq++;
-            // Brief pause to allow SCU to process the trigger before RX pump starts
-            await Task.Delay(60, ct);
+            await Task.Delay(80, ct);
         }
 
         _rxPumpTask = Task.Run(RxPumpAsync, _cts.Token);
         _txPumpTask = Task.Run(TxPumpAsync, _cts.Token);
 
-        _log.LogInformation("AudioChannel started — {Quality} ({Rate} Hz stereo 16-bit)",
+        _log.LogInformation("AudioChannel started — {Quality} ({Rate} Hz stereo)",
             _quality, wireFormat.SampleRate);
     }
 
@@ -210,13 +198,14 @@ public sealed class AudioChannel : IAsyncDisposable
         {
             await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(3));
         }
-        catch { /* timeout fine */ }
+        catch { }
 
         _waveOut?.Dispose();
         _waveOut = null;
         _waveIn?.Dispose();
         _waveIn = null;
         _rxBuffer = null;
+
         _log.LogInformation("AudioChannel stopped");
     }
 
@@ -224,16 +213,26 @@ public sealed class AudioChannel : IAsyncDisposable
 
     private async Task RxPumpAsync()
     {
-        _log.LogDebug("RX audio pump started");
+        _log.LogDebug("RX audio pump started ({Mode})", _quality);
 
-        byte expectedRxType = Is8k ? RxType8k : RxType16k;
+        bool decode8kULaw = _quality == AudioQuality.ULaw8k;
+        bool is8k = Is8k;
+        byte expectedType = is8k ? RxType8k : RxType16k;
+
+        byte[] wire = ArrayPool<byte>.Shared.Rent(MaxRxWireBytes);
         byte[] pcm = ArrayPool<byte>.Shared.Rent(MaxRxPcmBytes);
+
+        // 8k deduplication: SCU sends 2 copies ~1ms apart. At 8kHz this creates
+        // a comb filter with nulls at ~1000 Hz — fatal for FT8. Track the frame
+        // ID from fun[6:8] and skip any packet with the same ID as the last one.
+        // 16k modes intentionally skip deduplication (confirmed working as-is).
+        int lastFrameId = -1;
 
         try
         {
             await foreach (var frame in _path!.Frames.ReadAllAsync(_cts.Token))
             {
-                if (frame.ZzType != expectedRxType)
+                if (frame.ZzType != expectedType)
                     continue;
 
                 var raw = frame.Raw;
@@ -242,37 +241,90 @@ public sealed class AudioChannel : IAsyncDisposable
 
                 byte kl = raw[6], kh = raw[7];
 
-                // Read audio payload length from fun[28:30] dynamically.
-                int hdr28 = ((~28 + 1) & 0xff) ^ raw[8 + 28] ^ kl ^ kh;
-                int hdr29 = ((~29 + 1) & 0xff) ^ raw[8 + 29] ^ kl ^ kh;
-                int audioLen = hdr28 | (hdr29 << 8);
-
-                int available = raw.Length - (8 + FunHdrBytesRx);
-                int limit = Math.Min(audioLen, Math.Min(available, MaxRxPcmBytes));
-                limit = (limit / 4) * 4;
-                if (limit < 4)
-                    continue;
-
-                // FUN-decode audio payload. fi is the full FUN payload index
-                // (header + audio), used as the XOR position key.
-                for (int i = 0; i < limit; i++)
+                // 8k deduplication: use fun[6:8] as the frame counter.
+                // fun[6] increments every unique frame; duplicate pairs share
+                // the same value. fun[0:2] is always 0x0002 (len) — do NOT use.
+                if (is8k)
                 {
-                    int fi = FunHdrBytesRx + i;
-                    pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
+                    int id0 = ((~6 + 1) & 0xff) ^ raw[8 + 6] ^ kl ^ kh;
+                    int id1 = ((~7 + 1) & 0xff) ^ raw[8 + 7] ^ kl ^ kh;
+                    int frameId = id0 | (id1 << 8);
+                    if (frameId == lastFrameId)
+                        continue;
+                    lastFrameId = frameId;
                 }
 
-                // SCU always sends 16-bit stereo PCM — swap L↔R and play.
-                SwapAndAdd(pcm, limit);
+                // Audio payload length from fun[28:30].
+                int hdr28 = ((~28 + 1) & 0xff) ^ raw[8 + 28] ^ kl ^ kh;
+                int hdr29 = ((~29 + 1) & 0xff) ^ raw[8 + 29] ^ kl ^ kh;
+                int wireLen = hdr28 | (hdr29 << 8);
+
+                int available = raw.Length - (8 + FunHdrBytesRx);
+                int limit = Math.Min(wireLen, Math.Min(available, MaxRxWireBytes));
+
+                if (decode8kULaw)
+                {
+                    // 8k µ-Law: wire = [L_ulaw, R_ulaw] × 80 stereo pairs.
+                    // L=main RX audio, R=0xff (µ-Law silence).
+                    limit = (limit / 2) * 2;
+                    if (limit < 2)
+                        continue;
+
+                    // FUN-decode wire bytes.
+                    for (int i = 0; i < limit; i++)
+                    {
+                        int fi = FunHdrBytesRx + i;
+                        wire[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
+                    }
+
+                    // Decode µ-Law pairs → stereo PCM.
+                    // Wire: even=L(audio), odd=R(silence).
+                    // Write audio into R position and silence into L position so
+                    // that SwapAndAdd moves audio to L — matching 16k PCM convention
+                    // and ensuring WSJT-X receives audio on the left channel.
+                    int pcmLen = 0;
+                    for (int i = 0; i < limit; i += 2)
+                    {
+                        short lSample = YaesuMuLaw.DecodeSample(wire[i]);      // audio
+                        short rSample = YaesuMuLaw.DecodeSample(wire[i + 1]);  // silence→0
+                        // Place audio in R, silence in L (SwapAndAdd will flip them).
+                        pcm[pcmLen++] = (byte)rSample;
+                        pcm[pcmLen++] = (byte)((ushort)rSample >> 8);
+                        pcm[pcmLen++] = (byte)lSample;
+                        pcm[pcmLen++] = (byte)((ushort)lSample >> 8);
+                    }
+
+                    SwapAndAdd(pcm, pcmLen);
+                }
+                else
+                {
+                    // 16k (all modes) and 8k PCM: raw 16-bit stereo PCM.
+                    limit = (limit / 4) * 4;
+                    if (limit < 4)
+                        continue;
+
+                    for (int i = 0; i < limit; i++)
+                    {
+                        int fi = FunHdrBytesRx + i;
+                        pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
+                    }
+
+                    SwapAndAdd(pcm, limit);
+                }
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { _log.LogError(ex, "RX audio pump error"); }
-        finally { ArrayPool<byte>.Shared.Return(pcm); }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(wire);
+            ArrayPool<byte>.Shared.Return(pcm);
+        }
 
         _log.LogDebug("RX audio pump stopped");
     }
 
-    /// <summary>Swap L↔R stereo pairs in-place then add to playback buffer.</summary>
+    /// <summary>Swap L↔R stereo pairs in-place then feed to playback buffer.</summary>
     private void SwapAndAdd(byte[] pcm, int len)
     {
         for (int i = 0; i < len; i += 4)
@@ -287,10 +339,13 @@ public sealed class AudioChannel : IAsyncDisposable
 
     private async Task TxPumpAsync()
     {
-        _log.LogDebug("TX audio pump started");
+        _log.LogDebug("TX audio pump started ({Mode})", _quality);
 
-        byte txType = Is8k ? TxType8k : TxType16k;
-        int txPcmBytes = Is8k ? TxPcmBytes8k : TxPcmBytes16k;
+        bool isULaw = IsULaw;
+        bool is8k = Is8k;
+        byte txType = is8k ? TxType8k : TxType16k;
+        int txWireBytes = is8k ? TxWireBytes8k : TxWireBytes16k;
+        int txPcmAccum = isULaw ? txWireBytes * 2 : txWireBytes;
 
         var micCh = Channel.CreateBounded<byte[]>(
             new BoundedChannelOptions(20) { FullMode = BoundedChannelFullMode.DropOldest });
@@ -305,7 +360,8 @@ public sealed class AudioChannel : IAsyncDisposable
         };
         _waveIn.StartRecording();
 
-        byte[] acc = new byte[txPcmBytes];
+        byte[] acc = new byte[txPcmAccum];
+        byte[] wireBuf = new byte[txWireBytes];
         int fill = 0;
 
         try
@@ -313,26 +369,28 @@ public sealed class AudioChannel : IAsyncDisposable
             using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(10));
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
-                while (fill < txPcmBytes && micCh.Reader.TryRead(out var chunk))
+                while (fill < txPcmAccum && micCh.Reader.TryRead(out var chunk))
                 {
-                    int copy = Math.Min(chunk.Length, txPcmBytes - fill);
+                    int copy = Math.Min(chunk.Length, txPcmAccum - fill);
                     Buffer.BlockCopy(chunk, 0, acc, fill, copy);
                     fill += copy;
                 }
 
-                byte[] pcm;
-                if (fill >= txPcmBytes)
+                if (fill >= txPcmAccum)
                 {
-                    pcm = acc;
-                    acc = new byte[txPcmBytes];
+                    if (isULaw)
+                        YaesuMuLaw.Encode(acc, txPcmAccum, wireBuf);
+                    else
+                        Buffer.BlockCopy(acc, 0, wireBuf, 0, txWireBytes);
+                    acc = new byte[txPcmAccum];
                     fill = 0;
                 }
                 else
                 {
-                    pcm = new byte[txPcmBytes];  // silence
+                    Array.Clear(wireBuf, 0, txWireBytes);
                 }
 
-                byte[] funPayload = BuildTxFunPayload(pcm);
+                byte[] funPayload = BuildTxFunPayload(wireBuf);
                 _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
                 _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
                 _txFrameSeq++;
@@ -347,54 +405,55 @@ public sealed class AudioChannel : IAsyncDisposable
 
     // ── TX FUN payload builder ────────────────────────────────────────────────
 
-    /// <summary>
-    /// Build the FUN header + PCM payload for a TX audio packet.
-    ///
-    /// 16 kHz (0xa6): 30-byte header, format=0x01 PCM, rate=16000, 642 bytes audio
-    /// 8 kHz  (0xc6): 32-byte header, format=0x03 µ-Law header field, rate=8000,
-    ///                160 bytes audio. Note: SCU sends PCM back regardless.
-    ///
-    /// Header confirmed byte-by-byte from Wireshark captures.
-    /// </summary>
-    private byte[] BuildTxFunPayload(byte[] pcm)
+    private byte[] BuildTxFunPayload(byte[] wireAudio)
     {
         bool is8k = Is8k;
+        bool isULaw = IsULaw;
         int hdrBytes = is8k ? FunHdrBytesTx8k : FunHdrBytesTx16k;
-        int txPcmBytes = pcm.Length;
+        int audioLen = wireAudio.Length;
         int sampleRate = is8k ? 8_000 : 16_000;
-        byte format = is8k ? (byte)0x03 : (byte)0x01;
+        byte format = isULaw ? (byte)0x03 : (byte)0x01;
 
-        var fun = new byte[hdrBytes + txPcmBytes];
+        var fun = new byte[hdrBytes + audioLen];
 
         fun[0] = 0x02;
         fun[1] = 0x00;
         fun[2] = 0x05;
         fun[3] = 0x01;
-        int dataLen = hdrBytes + txPcmBytes - 6;
+        int dataLen = hdrBytes + audioLen - 6;
         fun[4] = (byte)(dataLen & 0xff);
         fun[5] = (byte)(dataLen >> 8);
-        // fun[6..9] = SID/device bytes — mirror what we set in SendAudioOpen
-        // fun[6:10] in the Yaesu 8k capture = 52 00 00 00 (SID LE)
-        // For simplicity keep as 0x00 — SCU appears to accept this
+
+        if (is8k)
+        {
+            uint sid = (uint)(_helloAckNonce ^ 0x08);
+            fun[6] = (byte)sid;
+            fun[7] = (byte)(sid >> 8);
+            fun[8] = (byte)(sid >> 16);
+            fun[9] = (byte)(sid >> 24);
+        }
+
         fun[10] = _txFrameSeq;
-        fun[11] = is8k ? (byte)0x77 : (byte)0x65;  // fixed high byte from captures
+        fun[11] = is8k ? (byte)0x43 : (byte)0x65;
         fun[12] = format;
-        fun[13] = 0x02;   // stereo
+        fun[13] = 0x02;
         fun[14] = (byte)(sampleRate & 0xff);
         fun[15] = (byte)(sampleRate >> 8);
-        fun[16] = 0x00;
-        fun[17] = 0x00;
         fun[18] = 0x01;
-        // fun[19..25] = 0x00
         fun[26] = 0xd0;
-        fun[27] = 0x07;   // 2000 ms send buffer
-        fun[28] = is8k ? (byte)0xd0 : (byte)0xd0;
-        fun[29] = 0x07;   // 2000 ms recv buffer
-        fun[30] = 0x64;   // volume 100
-        fun[31] = 0x64;   // volume 100
-        // 8k has 2 extra header bytes (fun[32..33]) before audio — already zero
+        fun[27] = 0x07;
+        fun[28] = 0xd0;
+        fun[29] = 0x07;
+        fun[30] = 0x64;
+        fun[31] = 0x64;
 
-        Buffer.BlockCopy(pcm, 0, fun, hdrBytes, txPcmBytes);
+        if (is8k)
+        {
+            fun[32] = (byte)(audioLen & 0xff);
+            fun[33] = (byte)(audioLen >> 8);
+        }
+
+        Buffer.BlockCopy(wireAudio, 0, fun, hdrBytes, audioLen);
         return fun;
     }
 
