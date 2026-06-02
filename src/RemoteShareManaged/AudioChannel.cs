@@ -16,7 +16,7 @@ namespace RemoteShareManaged;
 ///
 ///   16 kHz modes (PCM 16k, µ-Law 16k):
 ///     RX  SCU→PC  ZZ type 0xa2, 30-byte FUN header + 640 bytes raw 16-bit stereo PCM
-///     TX  PC→SCU  ZZ type 0xa6, 30-byte FUN header + 642 bytes audio
+///     TX  PC→SCU  ZZ type 0xa6, 34-byte FUN header + 640 bytes audio
 ///     Packet size: 678 bytes RX / 682 bytes TX
 ///
 ///   8 kHz modes (PCM 8k, µ-Law 8k):
@@ -42,13 +42,15 @@ namespace RemoteShareManaged;
 ///   8k RX pump deduplicates using fun[6:8] as frame ID.
 ///   16k modes feed both copies (confirmed working, comb not audible at 16kHz).
 ///
-/// 0xc6 TX header (34 bytes):
-///   fun[6:10]  = SID (helloAckNonce^0x08) in ALL frames
-///   fun[11]    = 0x43
-///   fun[32:34] = audio_len LE (160)
+/// TX header (34 bytes, both 0xa6 and 0xc6 — confirmed from Wireshark):
+///   fun[10]    = txFrameSeq low byte  (increments each unique frame)
+///   fun[11]    = txFrameSeq high byte (increments every 256 frames ~2.56s)
+///   fun[30:32] = volume bytes (0x64, 0x64)
+///   fun[32:34] = audio_len LE
 ///   fun[34+]   = audio data
+///   0xc6 additionally: fun[6:10] = SID (helloAckNonce^0x08) in ALL frames
 ///
-/// Stereo layout: main RX on L (after L↔R swap), sub-RX on R.
+/// Stereo layout: main RX on L wire, sub-RX on R wire. No swap needed for 16k paths.
 /// PTT: ScuSession.SendCatAsync("TX;") / "RX;".
 /// </summary>
 public sealed class AudioChannel : IAsyncDisposable
@@ -56,15 +58,17 @@ public sealed class AudioChannel : IAsyncDisposable
     // ── Wire format constants ─────────────────────────────────────────────────
 
     private const int FunHdrBytesRx = 30;
-    private const int FunHdrBytesTx16k = 30;
-    private const int FunHdrBytesTx8k = 34;
+    // Both 0xa6 (16k) and 0xc6 (8k) TX headers are 34 bytes — confirmed from
+    // Wireshark: fun[30:32]=volume, fun[32:34]=audio_len, audio starts at fun[34].
+    private const int FunHdrBytesTx16k = 34;
+    private const int FunHdrBytesTx8k  = 34;
 
     private const byte RxType16k = 0xa2;
     private const byte TxType16k = 0xa6;
     private const byte RxType8k = 0xc2;
     private const byte TxType8k = 0xc6;
 
-    private const int TxWireBytes16k = 642;
+    private const int TxWireBytes16k = 640;
     private const int TxWireBytes8k = 160;
 
     private const int MaxRxWireBytes = 640;
@@ -99,7 +103,7 @@ public sealed class AudioChannel : IAsyncDisposable
     private Task? _rxPumpTask;
     private Task? _txPumpTask;
 
-    private byte _txFrameSeq;
+    private ushort _txFrameSeq;  // 16-bit: fun[10]=low byte, fun[11]=high byte
 
     public bool IsRunning
     {
@@ -311,7 +315,8 @@ public sealed class AudioChannel : IAsyncDisposable
                         pcm[i] = (byte)(((~fi + 1) & 0xff) ^ raw[8 + fi] ^ kl ^ kh);
                     }
 
-                    SwapAndAdd(pcm, limit);
+                    // Wire is already Main=L, Sub=R — no swap needed.
+                    _rxBuffer!.AddSamples(pcm, 0, limit);
                 }
             }
         }
@@ -435,8 +440,8 @@ public sealed class AudioChannel : IAsyncDisposable
             fun[9] = (byte)(sid >> 24);
         }
 
-        fun[10] = _txFrameSeq;
-        fun[11] = is8k ? (byte)0x43 : (byte)0x65;
+        fun[10] = (byte)(_txFrameSeq & 0xff);
+        fun[11] = (byte)(_txFrameSeq >> 8);
         fun[12] = format;
         fun[13] = 0x02;
         fun[14] = (byte)(sampleRate & 0xff);
@@ -448,12 +453,9 @@ public sealed class AudioChannel : IAsyncDisposable
         fun[29] = 0x07;
         fun[30] = 0x64;
         fun[31] = 0x64;
-
-        if (is8k)
-        {
-            fun[32] = (byte)(audioLen & 0xff);
-            fun[33] = (byte)(audioLen >> 8);
-        }
+        // audio_len field present in both 0xa6 and 0xc6 (confirmed from Wireshark)
+        fun[32] = (byte)(audioLen & 0xff);
+        fun[33] = (byte)(audioLen >> 8);
 
         Buffer.BlockCopy(wireAudio, 0, fun, hdrBytes, audioLen);
         return fun;
