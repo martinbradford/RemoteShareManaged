@@ -70,7 +70,9 @@ public sealed class AudioChannel : IAsyncDisposable
     private const int MaxRxWireBytes = 640;
     private const int MaxRxPcmBytes = 640;
 
-    private bool Is8k => _quality is AudioQuality.Pcm8k or AudioQuality.ULaw8k;
+    // SCU has no PCM 8k mode — Wireshark confirms Yaesu app uses 0xa6/0xa2 (16k packets)
+    // for PCM 8k. Only ULaw8k genuinely uses the 0xc6/0xc2 8k path.
+    private bool Is8k => _quality == AudioQuality.ULaw8k;
     private bool IsULaw => _quality is AudioQuality.ULaw16k or AudioQuality.ULaw8k;
 
     public WaveFormat WireFormat => Is8k
