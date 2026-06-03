@@ -535,9 +535,9 @@ public sealed class ScuSession : IAsyncDisposable
     /// sequence counter. Call StartAsync() on the returned instance to open
     /// the audio channel and begin audio flow.
     /// </summary>
-    public AudioChannel CreateAudioChannel(int waveOutDevice = 0, ILoggerFactory? loggerFactory = null)
+    public AudioChannel CreateAudioChannel(int waveOutDevice = 0, ILoggerFactory? loggerFactory = null, int waveInDevice = 0)
         => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync,
-                            _audioQuality, waveOutDevice, loggerFactory);
+                            _audioQuality, waveOutDevice, waveInDevice, loggerFactory);
 
     // ── Steady-state tasks ────────────────────────────────────────────────────
 

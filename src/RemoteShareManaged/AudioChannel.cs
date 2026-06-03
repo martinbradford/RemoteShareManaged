@@ -93,6 +93,7 @@ public sealed class AudioChannel : IAsyncDisposable
     private readonly Func<RemotePath, CancellationToken, Task> _channelOpen;
     private readonly AudioQuality _quality;
     private readonly int _waveOutDevice;
+    private readonly int _waveInDevice;
 
     private RemotePath? _path;
     private WaveOutEvent? _waveOut;
@@ -119,6 +120,7 @@ public sealed class AudioChannel : IAsyncDisposable
         Func<RemotePath, CancellationToken, Task> channelOpen,
         AudioQuality quality = AudioQuality.Pcm16k,
         int waveOutDevice = 0,
+        int waveInDevice = 0,
         ILoggerFactory? loggerFactory = null)
     {
         _addr = addr;
@@ -127,6 +129,7 @@ public sealed class AudioChannel : IAsyncDisposable
         _channelOpen = channelOpen;
         _quality = quality;
         _waveOutDevice = waveOutDevice;
+        _waveInDevice = waveInDevice;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _log = _loggerFactory.CreateLogger<AudioChannel>();
     }
@@ -159,6 +162,7 @@ public sealed class AudioChannel : IAsyncDisposable
         {
             WaveFormat = wireFormat,
             BufferMilliseconds = 10,
+            DeviceNumber = _waveInDevice,
         };
 
         IsRunning = true;
