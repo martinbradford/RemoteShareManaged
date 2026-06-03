@@ -429,23 +429,21 @@ public sealed class AudioChannel : IAsyncDisposable
 
         fun[0] = 0x02;
         fun[1] = 0x00;
-        fun[2] = 0x05;
+        fun[2] = 0x05;   // MID = 0x0105 (confirmed from Yaesu reference capture)
         fun[3] = 0x01;
         int dataLen = hdrBytes + audioLen - 6;
         fun[4] = (byte)(dataLen & 0xff);
         fun[5] = (byte)(dataLen >> 8);
 
-        if (is8k)
-        {
-            uint sid = (uint)(_helloAckNonce ^ 0x08);
-            fun[6] = (byte)sid;
-            fun[7] = (byte)(sid >> 8);
-            fun[8] = (byte)(sid >> 16);
-            fun[9] = (byte)(sid >> 24);
-        }
+        // SID present in ALL TX frames (0xa6 and 0xc6) - confirmed from Yaesu reference capture
+        uint sid = (uint)(_helloAckNonce ^ 0x08);
+        fun[6] = (byte)sid;
+        fun[7] = (byte)(sid >> 8);
+        fun[8] = (byte)(sid >> 16);
+        fun[9] = (byte)(sid >> 24);
 
         fun[10] = (byte)(_txFrameSeq & 0xff);
-        fun[11] = (byte)(_txFrameSeq >> 8);
+        fun[11] = is8k ? (byte)0x43 : (byte)0x71;  // fixed constant (confirmed from Yaesu reference capture)
         fun[12] = format;
         fun[13] = 0x02;
         fun[14] = (byte)(sampleRate & 0xff);
