@@ -254,7 +254,7 @@ public sealed class AudioChannel : IAsyncDisposable
                 // 8k deduplication: use fun[6:8] as the frame counter.
                 // fun[6] increments every unique frame; duplicate pairs share
                 // the same value. fun[0:2] is always 0x0002 (len) — do NOT use.
-                if (is8k)
+                // Deduplicate on fun[6:8] for ALL modes, not just 8k.
                 {
                     int id0 = ((~6 + 1) & 0xff) ^ raw[8 + 6] ^ kl ^ kh;
                     int id1 = ((~7 + 1) & 0xff) ^ raw[8 + 7] ^ kl ^ kh;
