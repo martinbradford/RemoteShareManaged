@@ -63,7 +63,8 @@ public sealed class AudioChannel : IAsyncDisposable
     private const int FunHdrBytesTx16k = 34;
     private const int FunHdrBytesTx8k  = 34;
 
-    private const byte RxType16k = 0xa2;
+    private const byte RxType16k     = 0xa2;
+    private const byte RxType16kULaw = 0x62;  // SCU uses 0x62 for uLaw 16k RX
     private const byte TxType16k = 0xa6;
     private const byte RxType8k = 0xc2;
     private const byte TxType8k = 0xc6;
@@ -225,9 +226,11 @@ public sealed class AudioChannel : IAsyncDisposable
     {
         _log.LogDebug("RX audio pump started ({Mode})", _quality);
 
-        bool decode8kULaw = _quality == AudioQuality.ULaw8k;
+        bool decode8kULaw = _quality == AudioQuality.ULaw8k || _quality == AudioQuality.ULaw16k;
         bool is8k = Is8k;
-        byte expectedType = is8k ? RxType8k : RxType16k;
+        bool isULaw16k = _quality == AudioQuality.ULaw16k;
+        byte expectedType = is8k ? RxType8k : (isULaw16k ? RxType16kULaw : RxType16k);
+        bool skipDedup = false;  // deduplicate all modes on fun[6:8]
 
         byte[] wire = ArrayPool<byte>.Shared.Rent(MaxRxWireBytes);
         byte[] pcm = ArrayPool<byte>.Shared.Rent(MaxRxPcmBytes);
@@ -254,7 +257,8 @@ public sealed class AudioChannel : IAsyncDisposable
                 // 8k deduplication: use fun[6:8] as the frame counter.
                 // fun[6] increments every unique frame; duplicate pairs share
                 // the same value. fun[0:2] is always 0x0002 (len) — do NOT use.
-                // Deduplicate on fun[6:8] for ALL modes, not just 8k.
+                // Deduplicate on fun[6:8] for all modes except uLaw 16k (single-copy 0x62 frames).
+                if (!skipDedup)
                 {
                     int id0 = ((~6 + 1) & 0xff) ^ raw[8 + 6] ^ kl ^ kh;
                     int id1 = ((~7 + 1) & 0xff) ^ raw[8 + 7] ^ kl ^ kh;
@@ -305,6 +309,8 @@ public sealed class AudioChannel : IAsyncDisposable
                     }
 
                     SwapAndAdd(pcm, pcmLen);
+                    // ULaw16k: 0x62 frames are 5ms; feed twice to fill 16kHz buffer
+                    if (isULaw16k) _rxBuffer!.AddSamples(pcm, 0, pcmLen);
                 }
                 else
                 {
@@ -444,7 +450,7 @@ public sealed class AudioChannel : IAsyncDisposable
 
         fun[10] = (byte)(_txFrameSeq & 0xff);
         fun[11] = is8k ? (byte)0x43 : (byte)0x71;  // fixed constant (confirmed from Yaesu reference capture)
-        fun[12] = format;
+        fun[12] = format;  // SCU mirrors format byte in RX packet type selection
         fun[13] = 0x02;
         fun[14] = (byte)(sampleRate & 0xff);
         fun[15] = (byte)(sampleRate >> 8);
