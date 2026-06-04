@@ -235,6 +235,7 @@ public sealed class ScuSession : IAsyncDisposable
     // ── Login steps ───────────────────────────────────────────────────────────
 
     private byte _helloAckNonce; // dec[5] from HELLO-ACK — used to build KEY EXCHANGE and AUTH BLOB
+    public uint Sid => _helloAckNonce ^ 0x08u;
 
     private async Task<bool> DoLoginAsync(string user, string pass, CancellationToken ct)
     {
@@ -538,6 +539,9 @@ public sealed class ScuSession : IAsyncDisposable
     public AudioChannel CreateAudioChannel(int waveOutDevice = 0, ILoggerFactory? loggerFactory = null, int waveInDevice = 0)
         => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync,
                             _audioQuality, waveOutDevice, waveInDevice, loggerFactory);
+
+    public ScopeChannel CreateScopeChannel(ILoggerFactory? loggerFactory = null)
+        => new ScopeChannel(_addr, _helloAckNonce, NextSeq, _loggerFactory);
 
     // ── Steady-state tasks ────────────────────────────────────────────────────
 

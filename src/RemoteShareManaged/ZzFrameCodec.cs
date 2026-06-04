@@ -1,7 +1,7 @@
 using RemoteShareManaged.Protocol;
 using System.Buffers;
 
-namespace RemoteShareManaged.Codec;
+namespace RemoteShareManaged;
 
 /// <summary>
 /// Encodes and decodes ZZ-frames used on all four SCU-LAN10 UDP ports.
@@ -940,4 +940,116 @@ public static class ZzFrameCodec
         0x5a,0x5a,0x10,0x00,0x00,0x01,0xa5,0x20,0x85,0x31,0x33,0x32,
         0x34,0x35,0x35,0x37,0x36,0x39,0x6b,0xf8
     ];
+
+
+    // -----------------------------------------------------------------------
+    // ADD THESE METHODS TO ZzFrameCodec.cs
+    // They follow the same pattern as BuildDevPortConnect / BuildAudioOpen
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Builds a SendDevPortConnect packet for the scope channel (dev=3).
+    /// Mirrors the audio channel open on port 50002, but for port 50003.
+    /// FUN type 0x0E, MID 0x0104, 18 bytes total.
+    /// </summary>
+    public static byte[] BuildDevPortConnect(byte seq, uint sid, byte dev)
+    {
+        // FUN payload: len(2) + MID(2) + data_len(2) + SID(4) + dev(1) + pad(3)
+        var fun = new byte[12];
+        fun[0] = 0x02;
+        fun[1] = 0x00;          // len = 2 (includes SID)
+        fun[2] = 0x04;
+        fun[3] = 0x01;          // MID = 0x0104
+        fun[4] = 0x04;
+        fun[5] = 0x00;          // data_len = 4
+        fun[6] = (byte)(sid);                   // SID LE
+        fun[7] = (byte)(sid >> 8);
+        fun[8] = (byte)(sid >> 16);
+        fun[9] = (byte)(sid >> 24);
+        fun[10] = dev;                          // device: 1=CAT, 2=audio, 3=scope
+        fun[11] = 0x00;
+
+        return BuildFunFrame(0x0E, seq, fun);
+    }
+
+    /// <summary>
+    /// Builds a SendScopeOpen packet for port 50003.
+    /// Mirrors SendAudioOpen but for the scope channel.
+    /// FUN type 0x26, MID 0x0105.
+    /// NOTE: The exact payload fields for scope open are not yet confirmed
+    /// from a Yaesu reference capture. This uses the audio open structure
+    /// as a starting point — update once a Wireshark capture of the
+    /// full scope handshake is available.
+    /// </summary>
+    public static byte[] BuildScopeOpen(byte seq, uint sid)
+    {
+        // Tentative: mirrors SendAudioOpen payload structure
+        var fun = new byte[34];
+        fun[0] = 0x02;
+        fun[1] = 0x00;          // len = 2
+        fun[2] = 0x05;
+        fun[3] = 0x01;          // MID = 0x0105
+        fun[4] = 0x18;
+        fun[5] = 0x00;          // data_len = 24
+        fun[6] = (byte)(sid);                   // SID LE
+        fun[7] = (byte)(sid >> 8);
+        fun[8] = (byte)(sid >> 16);
+        fun[9] = (byte)(sid >> 24);
+        // Remaining payload: zeros (conservative default)
+        // Update once scope open sequence is captured from Wireshark
+
+        return BuildFunFrame(0x26, seq, fun);
+    }
+
+    /// <summary>
+    /// Builds a scope keepalive response (type 0x0E, MID 0x0187).
+    /// Sent in response to keepalive packets received from the SCU on port 50003.
+    /// </summary>
+    //public static byte[] BuildScopeKeepalive(byte seq, uint sid)
+    //{
+    //    var fun = new byte[10];
+    //    fun[0] = 0x06;
+    //    fun[1] = 0x00;          // len = 6
+    //    fun[2] = 0x87;
+    //    fun[3] = 0x01;          // MID = 0x0187
+    //    fun[4] = 0x04;
+    //    fun[5] = 0x00;          // data_len = 4
+    //    fun[6] = (byte)(sid);
+    //    fun[7] = (byte)(sid >> 8);
+    //    fun[8] = (byte)(sid >> 16);
+    //    fun[9] = (byte)(sid >> 24);
+
+    //    return BuildFunFrame(0x0E, seq, fun);
+    //}
+
+    //public static byte[] BuildScopeKeepalive(byte seq, uint sid)
+    //{
+    //    var fun = new byte[10];
+    //    fun[0] = 0x06;
+    //    fun[1] = 0x00;   // len = 6
+    //    fun[2] = 0x07;
+    //    fun[3] = 0x01;   // MID = 0x0107  ← was 0x0187
+    //    fun[4] = 0x04;
+    //    fun[5] = 0x00;   // data_len = 4
+    //    fun[6] = (byte)(sid);
+    //    fun[7] = (byte)(sid >> 8);
+    //    fun[8] = (byte)(sid >> 16);
+    //    fun[9] = (byte)(sid >> 24);
+    //    return BuildFunFrame(0x0E, seq, fun);
+    //}
+
+
+    // Replace BuildScopeKeepalive in ZzFrameCodec.cs with this version:
+
+    public static byte[] BuildScopeKeepalive(byte seq, byte helloAckNonce)
+    {
+        uint sid = (uint)(helloAckNonce ^ 0x08);
+        Span<byte> buf = stackalloc byte[10];
+        BinaryPrimitives_WriteUInt16LE(buf, 0, 0x0006);  // len = 6
+        BinaryPrimitives_WriteUInt16LE(buf, 2, 0x0107);  // MID = 0x0107 (confirmed from Wireshark)
+        BinaryPrimitives_WriteUInt16LE(buf, 4, 0x0004);  // data_len = 4
+        BinaryPrimitives_WriteUInt32LE(buf, 6, sid);
+        return BuildFunFrame(0x0E, seq, buf);
+    }
+
 }
