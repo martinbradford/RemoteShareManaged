@@ -85,22 +85,34 @@ namespace RemoteShareManaged
         // -----------------------------------------------------------------------
 
         public const int FrameSize = 4096;
-        public const int SpeBins = 264;
 
-        public const int SubWaterfallOffset = 0x0000;
-        public const int SubWaterfallLength = 800;
-        public const int SubSpeOffset = 0x0320;
-        public const int SubSpeLength = SpeBins;
+        // SPE (spectrum) data: 132 bins per channel, 1 unsigned byte per bin.
+        // Bin 0 = lowest frequency, bin 131 = highest frequency.
+        // Higher value = stronger signal.  Hz/bin ≈ span_Hz / 132.
+        //
+        // The frame is a WATERFALL RING BUFFER. Each received frame adds one new
+        // SPE row into the ring. The SPE data does NOT live at a fixed offset —
+        // the write pointer advances by ~86 bytes each frame.
+        //
+        // To extract the current spectrum, ProcessScopeFrame diffs consecutive
+        // frames: the 132-byte window that changed the most is the newest row.
+        // Sub and Main rings are in separate halves of the frame, separated by
+        // the boundary marker at BoundaryOffset.
+        public const int SpeBins = 132;
 
-        public const int BoundaryOffset = 0x06A4;  // fixed bytes 0x01, 0x3D
-        public const int MainSpeOffset = 0x06C2;
-        public const int MainSpeLength = SpeBins;
+        // The boundary marker 0x01 0x3D divides the SUB ring (below) from the
+        // MAIN ring (above). Confirmed from Wireshark binary analysis 2026-06-05.
+        public const int BoundaryOffset = 0x06A0;  // fixed bytes 0x01, 0x3D
 
-        public const int MainWaterfallOffset = 0x07D2;
-        public const int MainWaterfallLength = 898;
+        // Search regions for the freshest SPE row (diff-based extraction).
+        public const int SubRingStart = 0x0000;
+        public const int SubRingEnd = 0x06A0;
+        public const int MainRingStart = 0x06A2;
+        public const int MainRingEnd = 0x0C00;
+
+        // Frequency fields in metadata block (Big-Endian uint32, Hz).
+        // These are stable across frames — not inside the ring.
         public const int MetadataOffset = 0x0B54;
-
-        // Frequency fields in metadata block (Big-Endian uint32, Hz)
         public const int MainFreqOffset = 0x0BFC;
         public const int SubFreqOffset = 0x0C12;
 
@@ -116,6 +128,7 @@ namespace RemoteShareManaged
         private UdpClient? _udp;
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
+        private byte[]? _prevFrame;   // previous decoded frame for diff-based SPE extraction
 
         public bool IsRunning
         {
@@ -204,7 +217,7 @@ namespace RemoteShareManaged
                 return;
             }
 
-            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 6);
+            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 3);
             _log.LogDebug("Scope DevPortConnect sent ({Len} bytes): {Hex}",
                 connect.Length, Convert.ToHexString(connect));
             _udp.Client.SendTo(connect, RemoteEndPoint);
@@ -337,26 +350,78 @@ namespace RemoteShareManaged
             }
             // Bytes [available..FrameSize-1] remain 0 from array initialisation.
 
-            // Validate boundary marker
+            // Validate boundary marker (confirmed at 0x06A0 from Wireshark analysis)
             if (frameData[BoundaryOffset] != 0x01 ||
                 frameData[BoundaryOffset + 1] != 0x3D)
             {
                 _log.LogDebug("ScopeFrame: boundary marker mismatch — skipped");
+                _prevFrame = null;  // reset diff state on bad frame
                 return;
             }
 
-            // Extract SPE blocks
-            var mainSpe = new byte[SpeBins];
-            var subSpe = new byte[SpeBins];
-            Array.Copy(frameData, MainSpeOffset, mainSpe, 0, SpeBins);
-            Array.Copy(frameData, SubSpeOffset, subSpe, 0, SpeBins);
+            // ── Diff-based SPE extraction ─────────────────────────────────────────
+            // The 4096-byte frame is a waterfall ring buffer. Each delivered frame
+            // writes one new 132-byte SPE row into the ring. The write pointer
+            // advances by ~86 bytes per frame, so the current SPE does not live at a
+            // fixed offset. We find it by diffing consecutive frames: the 132-byte
+            // window with the largest sum of absolute byte differences is the row that
+            // was just written — i.e. the live spectrum.
+            //
+            // Sub and Main rings are separated by the boundary marker at 0x06A0:
+            //   Sub ring:  0x0000 .. 0x069F
+            //   Main ring: 0x06A2 .. 0x0BFF
+            byte[] mainSpe;
+            byte[] subSpe;
 
-            // Extract VFO frequencies from metadata (Big-Endian uint32, Hz)
+            if (_prevFrame is null || _prevFrame.Length != FrameSize)
+            {
+                // No previous frame yet — use a flat noise-floor placeholder
+                mainSpe = new byte[SpeBins];
+                subSpe = new byte[SpeBins];
+                Array.Fill(mainSpe, (byte)128);
+                Array.Fill(subSpe, (byte)128);
+            }
+            else
+            {
+                mainSpe = FindFreshestRow(frameData, _prevFrame, MainRingStart, MainRingEnd);
+                subSpe = FindFreshestRow(frameData, _prevFrame, SubRingStart, SubRingEnd);
+            }
+
+            _prevFrame = frameData;
+
+            // Frequency metadata is stable (not in the ring) — read directly
             uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
             uint subFreqHz = ReadBEUInt32(frameData, SubFreqOffset);
 
             FrameReceived?.Invoke(new ScopeFrame(
                 mainSpe, subSpe, frameData, mainFreqHz, subFreqHz));
+        }
+
+        /// <summary>
+        /// Scan a region of the frame for the 132-byte window with the largest
+        /// sum of absolute differences vs the previous frame. That window is the
+        /// SPE row most recently written into the waterfall ring buffer.
+        /// </summary>
+        private static byte[] FindFreshestRow(byte[] curr, byte[] prev, int start, int end)
+        {
+            int bestOffset = start;
+            long bestDiff = -1;
+
+            for (int offset = start; offset <= end - SpeBins; offset++)
+            {
+                long diff = 0;
+                for (int i = 0; i < SpeBins; i++)
+                    diff += Math.Abs(curr[offset + i] - prev[offset + i]);
+                if (diff > bestDiff)
+                {
+                    bestDiff = diff;
+                    bestOffset = offset;
+                }
+            }
+
+            var row = new byte[SpeBins];
+            Array.Copy(curr, bestOffset, row, 0, SpeBins);
+            return row;
         }
 
         // -----------------------------------------------------------------------
