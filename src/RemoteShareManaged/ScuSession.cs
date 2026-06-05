@@ -494,7 +494,18 @@ public sealed class ScuSession : IAsyncDisposable
     ///   3. PC→SCU:50002  SendAudioOpen ×2 (0x26, MID=0x0105) — audio config
     ///   4. SCU begins sending 0xa2 RX audio ~40ms later
     /// </summary>
-    internal async Task DoAudioChannelOpenAsync(RemotePath audioPath, CancellationToken ct)
+    /// <summary>
+    /// Open the audio channel on port 50002.
+    /// <para>
+    /// ORDERING: scope.SendDevPortConnect() is called after the audio ACK but
+    /// before SendAudioOpen. This is the only window in which the SCU accepts a
+    /// scope DevPortConnect — confirmed from Wireshark analysis 2026-06-05.
+    /// Once SendAudioOpen is sent the SCU enters streaming mode and ignores
+    /// further DevPortConnect requests on port 50003.
+    /// </para>
+    /// </summary>
+    internal async Task DoAudioChannelOpenAsync(
+        RemotePath audioPath, CancellationToken ct, ScopeChannel? scope = null)
     {
         _log.LogDebug("Opening audio channel (port 50002)...");
 
@@ -522,6 +533,17 @@ public sealed class ScuSession : IAsyncDisposable
         else
             _log.LogDebug("Audio SendDevPortConnect ACK received");
 
+        // ── Scope DevPortConnect (MUST come before SendAudioOpen) ─────────────
+        // Confirmed from Wireshark: the SCU only accepts the scope DevPortConnect
+        // in the window between the audio ACK and SendAudioOpen. Once SendAudioOpen
+        // is sent, the SCU ignores port 50003 DevPortConnect requests entirely.
+        if (scope is not null)
+        {
+            scope.SendDevPortConnect();
+            _log.LogDebug("Scope DevPortConnect sent — waiting 20ms before SendAudioOpen");
+            await Task.Delay(20, ct);   // ← add this
+        }
+
         // Duplicate pair — same content sent twice
         audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
         audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
@@ -536,12 +558,34 @@ public sealed class ScuSession : IAsyncDisposable
     /// sequence counter. Call StartAsync() on the returned instance to open
     /// the audio channel and begin audio flow.
     /// </summary>
-    public AudioChannel CreateAudioChannel(int waveOutDevice = 0, ILoggerFactory? loggerFactory = null, int waveInDevice = 0)
-        => new AudioChannel(_addr, _helloAckNonce, NextSeq, DoAudioChannelOpenAsync,
-                            _audioQuality, waveOutDevice, waveInDevice, loggerFactory);
+    /// <param name="scope">
+    /// Optional ScopeChannel. When supplied, its DevPortConnect is sent at the
+    /// correct point inside DoAudioChannelOpenAsync (after audio ACK, before
+    /// SendAudioOpen) so that scope data starts flowing automatically.
+    /// The ScopeChannel must have been created via CreateScopeChannel() and
+    /// StartAsync() must have been called on it first to open its socket.
+    /// </param>
+    public AudioChannel CreateAudioChannel(
+        int waveOutDevice = 0,
+        ILoggerFactory? loggerFactory = null,
+        int waveInDevice = 0,
+        ScopeChannel? scope = null)
+    {
+        // Capture scope in the closure so the channel-open delegate can pass it
+        // through to DoAudioChannelOpenAsync without changing the AudioChannel API.
+        return new AudioChannel(
+            _addr, _helloAckNonce, NextSeq,
+            (path, ct) => DoAudioChannelOpenAsync(path, ct, scope),
+            _audioQuality, waveOutDevice, waveInDevice, loggerFactory);
+    }
 
+    /// <summary>
+    /// Create a ScopeChannel. Call StartAsync() on it to open the socket, then
+    /// pass it to CreateAudioChannel(scope: ...) so the session wires up the
+    /// DevPortConnect at the correct moment during audio channel open.
+    /// </summary>
     public ScopeChannel CreateScopeChannel(ILoggerFactory? loggerFactory = null)
-        => new ScopeChannel(_addr, _helloAckNonce, NextSeq, _loggerFactory);
+        => new ScopeChannel(_addr, _helloAckNonce, NextSeq, loggerFactory ?? _loggerFactory);
 
     // ── Steady-state tasks ────────────────────────────────────────────────────
 

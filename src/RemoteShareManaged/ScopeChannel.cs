@@ -28,7 +28,7 @@ namespace RemoteShareManaged
     ///     [2]     0x0A   (type = scope data)
     ///     [3:6]   00 00 01
     ///     [6]     kl  (seq byte)
-    ///     [7]     kh  (nonceB = -(seq*0x60)&0xff)
+    ///     [7]     kh  (nonceB = -(seq*0x60)&amp;0xff)
     ///     [8+]    FUN-encoded payload
     ///
     ///   FUN decoded payload:
@@ -40,11 +40,20 @@ namespace RemoteShareManaged
     ///                  (last 4 bytes may be absent — raw is 4110 bytes but
     ///                   full decode needs 4114; decode loop guards with bounds check)
     ///
-    ///   SCOPE OPEN SEQUENCE (confirmed from Wireshark):
-    ///     PC sends BuildSendAudioConnect(dev=3) — 18 bytes, same structure as
-    ///     audio DevPortConnect but with dev=3. SCU responds with 0x0E MID=0x0184 ACK
-    ///     then immediately starts streaming 0x0A scope frames.
-    ///     There is NO SendScopeOpen (type 0x26) — unlike audio.
+    ///   SCOPE OPEN SEQUENCE (confirmed from Wireshark 2026-06-05):
+    ///     ORDERING IS CRITICAL. The scope DevPortConnect MUST be sent after the
+    ///     audio DevPortConnect ACK but BEFORE SendAudioOpen. Once SendAudioOpen
+    ///     is sent, the SCU enters streaming mode and ignores new DevPortConnect
+    ///     requests on port 50003.
+    ///
+    ///     Correct sequence (from Yaesu reference session 2):
+    ///       1. Audio DevPortConnect (dev=2)   → wait for audio ACK
+    ///       2. Scope DevPortConnect (dev=3)   ← BEFORE SendAudioOpen
+    ///       3. SendAudioOpen ×2
+    ///       4. Scope ACK arrives (~35ms later), scope frames stream immediately
+    ///
+    ///     This is implemented via ScopeChannel.SendDevPortConnectAsync(), which
+    ///     DoAudioChannelOpenAsync() calls at the correct point in the sequence.
     ///
     ///   KEEPALIVE (confirmed from Wireshark):
     ///     SCU sends type 0x0E, MID 0x0187 to PC at ~1s intervals.
@@ -65,7 +74,7 @@ namespace RemoteShareManaged
     ///   Higher value = stronger signal.  Hz/bin = span_Hz / 264.
     ///   Cadence: ~40 ms (~25 frames/second).
     ///
-    ///   SEQUENCE COUNTER: uses the session-shared counter (Func<byte> nextSeq)
+    ///   SEQUENCE COUNTER: uses the session-shared counter (Func&lt;byte&gt; nextSeq)
     ///   exactly as AudioChannel does — the SCU rejects DevPortConnect if the
     ///   seq is out of sync with the established session.
     /// </summary>
@@ -124,7 +133,7 @@ namespace RemoteShareManaged
         public event Action<ScopeFrame>? FrameReceived;
 
         // -----------------------------------------------------------------------
-        // Construction — mirrors AudioChannel constructor pattern exactly
+        // Construction
         // -----------------------------------------------------------------------
 
         /// <param name="addr">SCU-LAN10 IP address, e.g. "192.168.4.190"</param>
@@ -148,10 +157,16 @@ namespace RemoteShareManaged
         // Lifecycle
         // -----------------------------------------------------------------------
 
-        public async Task StartAsync(CancellationToken ct = default)
+        /// <summary>
+        /// Open the UDP socket and start the receive loop.
+        /// Does NOT send the DevPortConnect — that is done at the right moment
+        /// by SendDevPortConnectAsync(), called from DoAudioChannelOpenAsync()
+        /// before SendAudioOpen is sent.
+        /// </summary>
+        public Task StartAsync(CancellationToken ct = default)
         {
             if (IsRunning)
-                return;
+                return Task.CompletedTask;
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
@@ -169,12 +184,31 @@ namespace RemoteShareManaged
             var localPort = ((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
             _log.LogDebug("ScopeChannel bound to local port {Port}", localPort);
 
-            await DoScopeOpenAsync(_cts.Token);
-
             IsRunning = true;
             _receiveTask = ReceiveLoopAsync(_cts.Token);
 
-            _log.LogInformation("ScopeChannel started");
+            _log.LogInformation("ScopeChannel socket open — waiting for DevPortConnect signal");
+            return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Send the scope DevPortConnect packet (dev=3, BuildSendAudioConnect).
+        /// Must be called AFTER the audio DevPortConnect ACK and BEFORE SendAudioOpen.
+        /// Called by DoAudioChannelOpenAsync() at the correct point in the sequence.
+        /// </summary>
+        public void SendDevPortConnect()
+        {
+            if (_udp is null)
+            {
+                _log.LogWarning("SendDevPortConnect called but socket not open — call StartAsync first");
+                return;
+            }
+
+            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 6);
+            _log.LogDebug("Scope DevPortConnect sent ({Len} bytes): {Hex}",
+                connect.Length, Convert.ToHexString(connect));
+            _udp.Client.SendTo(connect, RemoteEndPoint);
+            // No wait — ACK arrives asynchronously, scope frames follow within ~35ms
         }
 
         public async Task StopAsync()
@@ -198,24 +232,6 @@ namespace RemoteShareManaged
 
             _udp = null;
             _log.LogInformation("ScopeChannel stopped");
-        }
-
-        // -----------------------------------------------------------------------
-        // Scope open sequence (confirmed from Wireshark)
-        // -----------------------------------------------------------------------
-
-        private async Task DoScopeOpenAsync(CancellationToken ct)
-        {
-            // Use BuildSendAudioConnect with dev=3 (scope device).
-            // This produces an 18-byte packet identical in structure to the audio
-            // DevPortConnect — confirmed from Yaesu Wireshark capture.
-            // The SCU ACKs with 0x0E MID=0x0184 then begins streaming 0x0A frames.
-            // Only one send is needed (Yaesu app sends one, not two).
-            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 3);
-            _udp!.Client.SendTo(connect, RemoteEndPoint);
-
-            // Wait for SCU to start streaming (~100ms observed in Wireshark)
-            await Task.Delay(200, ct);
         }
 
         // -----------------------------------------------------------------------
@@ -270,7 +286,6 @@ namespace RemoteShareManaged
 
                 case 0x0E:
                     // Keepalive from SCU — respond with MID 0x0107
-                    // (confirmed from Yaesu Wireshark capture)
                     var response = ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce);
                     try
                     {
