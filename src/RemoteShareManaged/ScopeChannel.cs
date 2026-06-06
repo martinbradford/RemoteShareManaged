@@ -540,30 +540,40 @@ namespace RemoteShareManaged
             // Get max-hold across all 7 ring rows (raw frame values).
             var (rawMain, rawSub) = ExtractSpeMaxHold(frameData);
 
-            // Apply decaying max-hold: raise any bin that exceeds the current held
-            // value; decay all others toward zero by DecayPerFrame per frame.
-            // This lets FT8 signal peaks persist briefly then fade, revealing genuine
-            // frequency structure that static max-hold buries by saturating all bins.
+            // Baseline subtraction: the ring saturates quickly on a busy band — all
+            // bins reach their historical peak (min ≈ 200 on 20m FT8). Subtracting
+            // the per-channel floor (min across all bins) removes the shared DC
+            // saturation and exposes the differential structure:
+            //   floor-subtracted value = raw[i] - min(raw)
+            //   FT8 signal bin (raw=245, floor=200): 45
+            //   Quiet bin       (raw=202, floor=200):  2
+            // Apply decaying max-hold on the floor-subtracted values.
+            byte mainFloor = rawMain[0]; for (int i = 1; i < SpeBins; i++) if (rawMain[i] < mainFloor) mainFloor = rawMain[i];
+            byte subFloor  = rawSub[0];  for (int i = 1; i < SpeBins; i++) if (rawSub[i]  < subFloor)  subFloor  = rawSub[i];
+
             if (!_decayInitialised)
             {
-                Array.Copy(rawMain, _mainDecay, SpeBins);
-                Array.Copy(rawSub,  _subDecay,  SpeBins);
+                // Start from zero so the display builds structure from scratch
+                // rather than inheriting the fully-saturated initial state.
                 _decayInitialised = true;
             }
             for (int i = 0; i < SpeBins; i++)
             {
-                if (rawMain[i] >= _mainDecay[i])
-                    _mainDecay[i] = rawMain[i];
+                byte m = (byte)(rawMain[i] - mainFloor);
+                byte s = (byte)(rawSub[i]  - subFloor);
+
+                if (m >= _mainDecay[i])
+                    _mainDecay[i] = m;
                 else
                     _mainDecay[i] = (byte)Math.Max(0, _mainDecay[i] - DecayPerFrame);
 
-                if (rawSub[i] >= _subDecay[i])
-                    _subDecay[i] = rawSub[i];
+                if (s >= _subDecay[i])
+                    _subDecay[i] = s;
                 else
                     _subDecay[i] = (byte)Math.Max(0, _subDecay[i] - DecayPerFrame);
             }
 
-            // Snapshot decayed values for the event.
+            // Snapshot decayed floor-relative values for the event.
             var mainSpe = (byte[])_mainDecay.Clone();
             var subSpe  = (byte[])_subDecay.Clone();
 
