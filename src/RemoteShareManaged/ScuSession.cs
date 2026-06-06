@@ -537,11 +537,16 @@ public sealed class ScuSession : IAsyncDisposable
         // Confirmed from Wireshark: the SCU only accepts the scope DevPortConnect
         // in the window between the audio ACK and SendAudioOpen. Once SendAudioOpen
         // is sent, the SCU ignores port 50003 DevPortConnect requests entirely.
+        //if (scope is not null)
+        //{
+        //    scope.SendDevPortConnect();
+        //    _log.LogDebug("Scope DevPortConnect sent — waiting 20ms before SendAudioOpen");
+        //    await Task.Delay(20, ct);   // ← add this
+        //}
+
         if (scope is not null)
         {
-            scope.SendDevPortConnect();
-            _log.LogDebug("Scope DevPortConnect sent — waiting 20ms before SendAudioOpen");
-            await Task.Delay(20, ct);   // ← add this
+            await scope.SendDevPortConnectAsync(TimeSpan.FromMilliseconds(200), ct);
         }
 
         // Duplicate pair — same content sent twice

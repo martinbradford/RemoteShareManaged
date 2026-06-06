@@ -6,6 +6,7 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace RemoteShareManaged
@@ -13,7 +14,7 @@ namespace RemoteShareManaged
     /// <summary>
     /// Receives spectrum scope data from the SCU-LAN10 on port 50003.
     ///
-    /// WIRE PROTOCOL (confirmed from Wireshark + FastDrawHelper facade analysis):
+    /// WIRE PROTOCOL (confirmed from Wireshark + binary analysis):
     ///
     ///   Each scope frame arrives as a single large UDP datagram, IP-fragmented
     ///   across 3 packets by the SCU:
@@ -46,32 +47,41 @@ namespace RemoteShareManaged
     ///     is sent, the SCU enters streaming mode and ignores new DevPortConnect
     ///     requests on port 50003.
     ///
-    ///     Correct sequence (from Yaesu reference session 2):
+    ///     Confirmed sequence (from Yaesu reference capture):
     ///       1. Audio DevPortConnect (dev=2)   → wait for audio ACK
-    ///       2. Scope DevPortConnect (dev=3)   ← BEFORE SendAudioOpen
-    ///       3. SendAudioOpen ×2
-    ///       4. Scope ACK arrives (~35ms later), scope frames stream immediately
+    ///       2. Scope DevPortConnect (dev=6)   ← BEFORE SendAudioOpen
+    ///       3. Wait for scope ACK (type 0x0E, ~35ms) — timeout fallback 200ms
+    ///       4. Wait additional 50ms settling time
+    ///       5. SendAudioOpen ×2
+    ///       6. Scope frames stream immediately
     ///
-    ///     This is implemented via ScopeChannel.SendDevPortConnectAsync(), which
-    ///     DoAudioChannelOpenAsync() calls at the correct point in the sequence.
+    ///     dev=6 (DinSpiIn) is confirmed correct. dev=3 produces a valid-looking
+    ///     packet that the SCU silently ignores.
+    ///
+    ///     The ACK wait is critical: sending SendAudioOpen only 22ms after the
+    ///     scope DevPortConnect (before the ACK arrives) causes the SCU to never
+    ///     start the scope data stream.
+    ///
+    ///     This is implemented via ScopeChannel.SendDevPortConnectAsync(), called
+    ///     from DoAudioChannelOpenAsync() at the correct point in the sequence.
     ///
     ///   KEEPALIVE (confirmed from Wireshark):
     ///     SCU sends type 0x0E, MID 0x0187 to PC at ~1s intervals.
     ///     PC sends type 0x0E, MID 0x0107 to SCU at ~1s intervals.
     ///
     ///   SCOPE FRAME LAYOUT (4096 bytes, confirmed from binary analysis):
-    ///     [0x0000-0x031F]  800 bytes   — SUB waterfall history
-    ///     [0x0320-0x0427]  264 bytes   — SUB SPE (spectrum), 1 byte/bin
-    ///     [0x0428-0x06A3]  636 bytes   — SUB metadata / gap
-    ///     [0x06A4-0x06A5]  2 bytes     — Fixed boundary marker: 0x01 0x3D
-    ///     [0x06A6-0x06C1]  28 bytes    — MAIN metadata gap
-    ///     [0x06C2-0x07C9]  264 bytes   — MAIN SPE (spectrum), 1 byte/bin
-    ///     [0x07CA-0x0B53]  906 bytes   — MAIN waterfall history
-    ///     [0x0B54-0x0FFF]  1196 bytes  — Metadata (frequency axis, span config)
+    ///     The frame is a WATERFALL RING BUFFER. Each received frame adds one
+    ///     new 132-byte SPE row into the ring. The write pointer advances ~86
+    ///     bytes per frame, so the SPE does NOT live at a fixed offset.
     ///
-    ///   SPE data: 264 bytes per channel, 1 unsigned byte per frequency bin.
-    ///   Bin 0 = lowest frequency, bin 263 = highest frequency.
-    ///   Higher value = stronger signal.  Hz/bin = span_Hz / 264.
+    ///     Boundary marker 0x01 0x3D at offset 0x06A0 divides:
+    ///       SUB ring:  0x0000 .. 0x069F  (132-byte rows, ~40 rows)
+    ///       MAIN ring: 0x06A2 .. 0x0BFF  (132-byte rows, ~40 rows)
+    ///       Metadata:  0x0B54 .. 0x0FFF  (frequency axis, span config)
+    ///
+    ///   SPE data: 66 bins per channel, 1 unsigned byte per bin.
+    ///   Bin 0 = lowest frequency, bin 65 = highest frequency.
+    ///   Higher value = stronger signal.  Hz/bin ≈ span_Hz / 66.
     ///   Cadence: ~40 ms (~25 frames/second).
     ///
     ///   SEQUENCE COUNTER: uses the session-shared counter (Func&lt;byte&gt; nextSeq)
@@ -86,35 +96,63 @@ namespace RemoteShareManaged
 
         public const int FrameSize = 4096;
 
-        // SPE (spectrum) data: 132 bins per channel, 1 unsigned byte per bin.
-        // Bin 0 = lowest frequency, bin 131 = highest frequency.
-        // Higher value = stronger signal.  Hz/bin ≈ span_Hz / 132.
+        // ── MAIN spectrum — confirmed location (pcapng analysis 2026-06-06) ──────
         //
-        // The frame is a WATERFALL RING BUFFER. Each received frame adds one new
-        // SPE row into the ring. The SPE data does NOT live at a fixed offset —
-        // the write pointer advances by ~86 bytes each frame.
+        // The MAIN spectrum lives at a FIXED offset, NOT in a ring buffer.
+        // Confirmed by comparing antenna vs dummy-load captures: this is the only
+        // 400-byte region whose variance is 8–10× higher with a live antenna than
+        // with a dummy load. The entire region is homogeneous and updated every frame.
         //
-        // To extract the current spectrum, ProcessScopeFrame diffs consecutive
-        // frames: the 132-byte window that changed the most is the newest row.
-        // Sub and Main rings are in separate halves of the frame, separated by
-        // the boundary marker at BoundaryOffset.
-        public const int SpeBins = 132;
+        // Encoding: two bytes per bin (200 bins × 2 bytes = 400 bytes).
+        //   even byte (frameData[offset + i*2    ]): rises with signal strength
+        //   odd  byte (frameData[offset + i*2 + 1]): falls with signal strength
+        //   noise floor: even ≈ 134, odd ≈ 122  → difference ≈ 12
+        //   strong signal: even ≈ 200, odd ≈ 60  → difference ≈ 140
+        //   display value = Max(0, even - odd)   → 0 at noise, up to ~255 at peak
+        //
+        // Bin 0 = lowest frequency, bin 199 = highest frequency.
+        // Hz per bin = SpanHz / 200.
+        public const int SpeBins       = 200;
+        public const int MainSpeOffset = 0x0768;  // 0x0768..0x08F7 (400 bytes)
 
-        // The boundary marker 0x01 0x3D divides the SUB ring (below) from the
-        // MAIN ring (above). Confirmed from Wireshark binary analysis 2026-06-05.
-        public const int BoundaryOffset = 0x06A0;  // fixed bytes 0x01, 0x3D
+        // SUB spectrum offset: not yet confirmed. Pending a capture where both
+        // VFOs are on dummy load (or a moving-carrier test on SUB VFO).
+        // SubSpe is returned as a zero-filled placeholder until this is resolved.
+        // public const int SubSpeOffset = ???;
 
-        // Search regions for the freshest SPE row (diff-based extraction).
-        public const int SubRingStart = 0x0000;
-        public const int SubRingEnd = 0x06A0;
-        public const int MainRingStart = 0x06A2;
-        public const int MainRingEnd = 0x0C00;
-
-        // Frequency fields in metadata block (Big-Endian uint32, Hz).
-        // These are stable across frames — not inside the ring.
+        // Frequency and span fields in metadata block.
+        // These are stable across frames — not inside any ring.
         public const int MetadataOffset = 0x0B54;
+
+        // VFO frequencies — Big-Endian uint32, Hz. Confirmed from Wireshark.
         public const int MainFreqOffset = 0x0BFC;
-        public const int SubFreqOffset = 0x0C12;
+        public const int SubFreqOffset  = 0x0C12;
+
+        // Span index — lower nibble of byte at SpanIndexOffset = FD_index.
+        // Upper nibble varies (0x80 in Yaesu-app pcapng, 0x40 in live testbed session).
+        // Lower nibble is stable across both: 0x46 & 0x0F = 6 = FD006 = 100kHz. ✓
+        //   frame[SpanIndexOffset] & 0x0F = FD_index
+        //   FD_index → span Hz via SpanTableHz[]
+        public const int SpanIndexOffset = 0x0BF2;
+
+        // FTdx101D span lookup: index i → span in Hz (FD00i CAT command).
+        // Confirmed: FD003=10k, FD005=50k, FD006=100k, FD007=200k,
+        //            FD008=500k, FD009=1000k (from pcapng analysis 2026-06-06).
+        //            FD000=1k, FD001=2k, FD002=5k, FD004=20k confirmed
+        //            from radio menu (full span list: 1/2/5/10/20/50/100/200/500/1000 kHz).
+        public static readonly uint[] SpanTableHz =
+        {
+              1_000,  // FD000
+              2_000,  // FD001
+              5_000,  // FD002
+             10_000,  // FD003 confirmed
+             20_000,  // FD004
+             50_000,  // FD005 confirmed
+            100_000,  // FD006 confirmed
+            200_000,  // FD007 confirmed
+            500_000,  // FD008 confirmed
+          1_000_000,  // FD009 confirmed
+        };
 
         // -----------------------------------------------------------------------
         // State
@@ -128,7 +166,18 @@ namespace RemoteShareManaged
         private UdpClient? _udp;
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
-        private byte[]? _prevFrame;   // previous decoded frame for diff-based SPE extraction
+        private int _frameCount;
+        private long _nextDiagTick;
+
+        // Channel used to hand 0x0E ACK packets from the receive loop to
+        // WaitForAckAsync() without blocking the receive loop.
+        private readonly Channel<byte[]> _ackChannel =
+            Channel.CreateBounded<byte[]>(new BoundedChannelOptions(8)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false,
+            });
 
         public bool IsRunning
         {
@@ -163,7 +212,7 @@ namespace RemoteShareManaged
             _helloAckNonce = helloAckNonce;
             _nextSeq = nextSeq;
             _log = (loggerFactory ?? NullLoggerFactory.Instance)
-                                 .CreateLogger<ScopeChannel>();
+                         .CreateLogger<ScopeChannel>();
         }
 
         // -----------------------------------------------------------------------
@@ -205,23 +254,61 @@ namespace RemoteShareManaged
         }
 
         /// <summary>
-        /// Send the scope DevPortConnect packet (dev=3, BuildSendAudioConnect).
-        /// Must be called AFTER the audio DevPortConnect ACK and BEFORE SendAudioOpen.
+        /// Send the scope DevPortConnect packet and wait for the SCU's 0x0E ACK.
+        ///
+        /// MUST be called AFTER the audio DevPortConnect ACK and BEFORE SendAudioOpen.
         /// Called by DoAudioChannelOpenAsync() at the correct point in the sequence.
+        ///
+        /// dev=6 (DinSpiIn) confirmed correct from Wireshark byte-for-byte comparison
+        /// with Yaesu reference capture. dev=3 is silently ignored by the SCU.
+        ///
+        /// Waits up to <paramref name="ackTimeout"/> for the SCU's 0x0E ACK, then
+        /// waits an additional 50ms settling time before returning. The Yaesu reference
+        /// capture shows ~35ms for the ACK and ~50ms total gap before SendAudioOpen.
+        /// Sending SendAudioOpen too soon (e.g. 22ms, before the ACK) causes the SCU
+        /// to never start the scope data stream.
         /// </summary>
-        public void SendDevPortConnect()
+        public async Task SendDevPortConnectAsync(
+            TimeSpan ackTimeout, CancellationToken ct = default)
         {
             if (_udp is null)
             {
-                _log.LogWarning("SendDevPortConnect called but socket not open — call StartAsync first");
+                _log.LogWarning("SendDevPortConnectAsync called but socket not open — call StartAsync first");
                 return;
             }
 
-            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 3);
+            // dev=6 = DinSpiIn — confirmed from Yaesu reference capture 2026-06-05.
+            // dev=3 produces a structurally valid packet that the SCU silently ignores.
+            var connect = ZzFrameCodec.BuildSendAudioConnect(_nextSeq(), _helloAckNonce, dev: 6);
             _log.LogDebug("Scope DevPortConnect sent ({Len} bytes): {Hex}",
                 connect.Length, Convert.ToHexString(connect));
             _udp.Client.SendTo(connect, RemoteEndPoint);
-            // No wait — ACK arrives asynchronously, scope frames follow within ~35ms
+
+            // Wait for the SCU's 0x0E ACK on port 50003.
+            // The receive loop feeds 0x0E packets into _ackChannel.
+            // Confirmed from Wireshark: ACK arrives ~35ms after DevPortConnect.
+            // Sending SendAudioOpen before this ACK (at ~22ms) silently breaks
+            // the scope stream.
+            //bool ackReceived = false;
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeoutCts.CancelAfter(ackTimeout);
+                await _ackChannel.Reader.ReadAsync(timeoutCts.Token);
+                _log.LogDebug("Scope DevPortConnect ACK received");
+            }
+            catch (OperationCanceledException)
+            {
+                if (ct.IsCancellationRequested)
+                    throw;
+                _log.LogWarning("Scope DevPortConnect ACK not received within {Ms}ms — continuing",
+                    (int)ackTimeout.TotalMilliseconds);
+            }
+
+            // Additional settling delay before SendAudioOpen. The Yaesu reference
+            // capture used ~50ms between scope DevPortConnect and SendAudioOpen even
+            // when the ACK arrived quickly at ~35ms.
+            await Task.Delay(50, ct);
         }
 
         public async Task StopAsync()
@@ -298,7 +385,13 @@ namespace RemoteShareManaged
                     break;
 
                 case 0x0E:
-                    // Keepalive from SCU — respond with MID 0x0107
+                    // Could be either the DevPortConnect ACK or a steady-state keepalive.
+                    // Feed into _ackChannel so SendDevPortConnectAsync can consume it.
+                    // After the connect phase keepalives arrive at ~1s intervals, so the
+                    // channel won't fill up in normal operation.
+                    _ackChannel.Writer.TryWrite(raw);
+
+                    // Respond with MID 0x0107 keepalive
                     var response = ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce);
                     try
                     {
@@ -350,78 +443,61 @@ namespace RemoteShareManaged
             }
             // Bytes [available..FrameSize-1] remain 0 from array initialisation.
 
-            // Validate boundary marker (confirmed at 0x06A0 from Wireshark analysis)
-            if (frameData[BoundaryOffset] != 0x01 ||
-                frameData[BoundaryOffset + 1] != 0x3D)
+            // ── MAIN SPE extraction (fixed offset, confirmed 2026-06-06) ─────────
+            // The MAIN spectrum is at a fixed offset 0x0768..0x08F7 (400 bytes),
+            // NOT in a ring buffer. Encoding: 2 bytes per bin — each pair encodes
+            // signal level around a midpoint of ~128:
+            //   noise floor: even≈134, odd≈122  (even above mid, odd below)
+            //   with signal: even rises further, odd falls further
+            //   e.g. S9+800: even≈175-220, odd≈47-085
+            //   display value = Max(0, even - odd)
+            //   → ~12 at noise (134-122), clamped to 0 after noise floor subtraction
+            //   → ~100-160 at strong signal
+            var mainSpe = new byte[SpeBins];
+            for (int i = 0; i < SpeBins; i++)
             {
-                _log.LogDebug("ScopeFrame: boundary marker mismatch — skipped");
-                _prevFrame = null;  // reset diff state on bad frame
-                return;
+                int even = frameData[MainSpeOffset + i * 2];
+                int odd  = frameData[MainSpeOffset + i * 2 + 1];
+                mainSpe[i] = (byte)Math.Max(0, even - odd);
             }
 
-            // ── Diff-based SPE extraction ─────────────────────────────────────────
-            // The 4096-byte frame is a waterfall ring buffer. Each delivered frame
-            // writes one new 132-byte SPE row into the ring. The write pointer
-            // advances by ~86 bytes per frame, so the current SPE does not live at a
-            // fixed offset. We find it by diffing consecutive frames: the 132-byte
-            // window with the largest sum of absolute byte differences is the row that
-            // was just written — i.e. the live spectrum.
-            //
-            // Sub and Main rings are separated by the boundary marker at 0x06A0:
-            //   Sub ring:  0x0000 .. 0x069F
-            //   Main ring: 0x06A2 .. 0x0BFF
-            byte[] mainSpe;
-            byte[] subSpe;
+            // SUB SPE: offset not yet confirmed — return zeros as placeholder.
+            // TODO: locate SubSpeOffset from a capture with both VFOs on dummy load
+            // or a moving-carrier test on the SUB VFO.
+            var subSpe = new byte[SpeBins];
 
-            if (_prevFrame is null || _prevFrame.Length != FrameSize)
-            {
-                // No previous frame yet — use a flat noise-floor placeholder
-                mainSpe = new byte[SpeBins];
-                subSpe = new byte[SpeBins];
-                Array.Fill(mainSpe, (byte)128);
-                Array.Fill(subSpe, (byte)128);
-            }
-            else
-            {
-                mainSpe = FindFreshestRow(frameData, _prevFrame, MainRingStart, MainRingEnd);
-                subSpe = FindFreshestRow(frameData, _prevFrame, SubRingStart, SubRingEnd);
-            }
-
-            _prevFrame = frameData;
-
-            // Frequency metadata is stable (not in the ring) — read directly
+            // Frequency and span metadata are stable (not in the ring) — read directly
             uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
-            uint subFreqHz = ReadBEUInt32(frameData, SubFreqOffset);
+            uint subFreqHz  = ReadBEUInt32(frameData, SubFreqOffset);
+
+            // Span index: lower nibble of frame[SpanIndexOffset] = FD CAT command index.
+            // Live session shows 0x46 (not 0x86) for FD006 (100kHz): upper nibble varies
+            // between sessions (0x40 in live, 0x80 in pcapng). Lower nibble is stable.
+            int spanIdx = frameData[SpanIndexOffset] & 0x0F;
+            uint spanHz = (uint)spanIdx < (uint)SpanTableHz.Length
+                ? SpanTableHz[spanIdx]
+                : 0;
+
+            // ── Diagnostic: log raw bytes at MainSpeOffset + SPE stats every 5s ─
+            _frameCount++;
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now >= _nextDiagTick)
+            {
+                _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[SPE diag frame#{_frameCount}] raw[0x{MainSpeOffset:X4}..+11]: ");
+                for (int i = 0; i < 12; i++)
+                    sb.Append($"{frameData[MainSpeOffset + i]:D3} ");
+                int speMin = mainSpe.Min();
+                int speMax = mainSpe.Max();
+                double speMean = mainSpe.Average(b => (double)b);
+                sb.Append($"| spe min={speMin} max={speMax} mean={speMean:F1}");
+                sb.Append($" | spanIdx={spanIdx} spanHz={spanHz} mainFreq={mainFreqHz}");
+                _log.LogInformation("{Msg}", sb.ToString());
+            }
 
             FrameReceived?.Invoke(new ScopeFrame(
-                mainSpe, subSpe, frameData, mainFreqHz, subFreqHz));
-        }
-
-        /// <summary>
-        /// Scan a region of the frame for the 132-byte window with the largest
-        /// sum of absolute differences vs the previous frame. That window is the
-        /// SPE row most recently written into the waterfall ring buffer.
-        /// </summary>
-        private static byte[] FindFreshestRow(byte[] curr, byte[] prev, int start, int end)
-        {
-            int bestOffset = start;
-            long bestDiff = -1;
-
-            for (int offset = start; offset <= end - SpeBins; offset++)
-            {
-                long diff = 0;
-                for (int i = 0; i < SpeBins; i++)
-                    diff += Math.Abs(curr[offset + i] - prev[offset + i]);
-                if (diff > bestDiff)
-                {
-                    bestDiff = diff;
-                    bestOffset = offset;
-                }
-            }
-
-            var row = new byte[SpeBins];
-            Array.Copy(curr, bestOffset, row, 0, SpeBins);
-            return row;
+                mainSpe, subSpe, frameData, mainFreqHz, subFreqHz, spanHz));
         }
 
         // -----------------------------------------------------------------------
@@ -456,16 +532,18 @@ namespace RemoteShareManaged
     public sealed class ScopeFrame
     {
         /// <summary>
-        /// MAIN receiver spectrum — 264 bytes, bin 0 = lowest frequency.
-        /// Amplitude: higher byte value = stronger signal.
-        /// Hz per bin = span_Hz / 264.
+        /// MAIN receiver spectrum — 200 bytes, bin 0 = lowest frequency.
+        /// Amplitude: higher byte value = stronger signal (0 = noise floor).
+        /// Decoded from two-byte pairs at frame offset 0x0768: value = Max(0, odd - even).
+        /// Hz per bin = span_Hz / 200.
         /// </summary>
         public byte[] MainSpe
         {
             get;
         }
 
-        /// <summary>SUB receiver spectrum — 264 bytes, same encoding as MainSpe.</summary>
+        /// <summary>SUB receiver spectrum — 200 bytes, same encoding as MainSpe.
+        /// Currently returns zeros (SUB frame offset not yet confirmed).</summary>
         public byte[] SubSpe
         {
             get;
@@ -489,21 +567,38 @@ namespace RemoteShareManaged
             get;
         }
 
+        /// <summary>
+        /// Scope span in Hz (from frame metadata span index). Zero if unknown.
+        /// Confirmed offsets: FD003=10k, FD005=50k … FD009=1000k.
+        /// </summary>
+        public uint SpanHz
+        {
+            get;
+        }
+
         /// <summary>Convenience: MAIN centre frequency in MHz.</summary>
         public double MainFrequencyMHz => MainFrequencyHz / 1_000_000.0;
 
         /// <summary>Convenience: SUB centre frequency in MHz.</summary>
         public double SubFrequencyMHz => SubFrequencyHz / 1_000_000.0;
 
+        /// <summary>
+        /// Hz per spectrum bin (= SpanHz / 200). Zero if span unknown.
+        /// Use for frequency-axis labelling: bin i covers
+        ///   centre ± (i - SpeBins/2) × HzPerBin
+        /// </summary>
+        public double HzPerBin => SpanHz > 0 ? SpanHz / (double)ScopeChannel.SpeBins : 0;
+
         public ScopeFrame(
             byte[] mainSpe, byte[] subSpe, byte[] rawFrame,
-            uint mainFreqHz, uint subFreqHz)
+            uint mainFreqHz, uint subFreqHz, uint spanHz)
         {
             MainSpe = mainSpe;
             SubSpe = subSpe;
             RawFrame = rawFrame;
             MainFrequencyHz = mainFreqHz;
             SubFrequencyHz = subFreqHz;
+            SpanHz = spanHz;
         }
     }
 }
