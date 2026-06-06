@@ -69,19 +69,29 @@ namespace RemoteShareManaged
     ///     SCU sends type 0x0E, MID 0x0187 to PC at ~1s intervals.
     ///     PC sends type 0x0E, MID 0x0107 to SCU at ~1s intervals.
     ///
-    ///   SCOPE FRAME LAYOUT (4096 bytes, confirmed from binary analysis):
-    ///     The frame is a WATERFALL RING BUFFER. Each received frame adds one
-    ///     new 132-byte SPE row into the ring. The write pointer advances ~86
-    ///     bytes per frame, so the SPE does NOT live at a fixed offset.
+    ///   SCOPE FRAME LAYOUT (4096 bytes, confirmed from binary analysis 2026-06-07):
     ///
-    ///     Boundary marker 0x01 0x3D at offset 0x06A0 divides:
-    ///       SUB ring:  0x0000 .. 0x069F  (132-byte rows, ~40 rows)
-    ///       MAIN ring: 0x06A2 .. 0x0BFF  (132-byte rows, ~40 rows)
-    ///       Metadata:  0x0B54 .. 0x0FFF  (frequency axis, span config)
+    ///     0x0000–0x0737  Spectrum ring buffer: 7 rows × 264 bytes = 1848 bytes.
+    ///                    Each row layout: [MAIN: 132 bytes][SUB: 132 bytes].
+    ///                    Single-byte amplitude per bin: higher = stronger signal.
+    ///                    Bin 0 = lowest frequency, bin 131 = highest.
+    ///                    The SCU writes one new row per frame, advancing a circular
+    ///                    write pointer through rows 0–6. The newest row contains the
+    ///                    current instantaneous spectrum; older rows retain recent history.
+    ///                    FastDrawHelper.dll applies max-hold across all 7 rows to render
+    ///                    the SPE display — we do the same.
+    ///                    SpeBins = 132 per channel. Hz/bin ≈ span_Hz / 132.
     ///
-    ///   SPE data: 66 bins per channel, 1 unsigned byte per bin.
-    ///   Bin 0 = lowest frequency, bin 65 = highest frequency.
-    ///   Higher value = stronger signal.  Hz/bin ≈ span_Hz / 66.
+    ///     0x0738–0x083F  Oscilloscope data (264 bytes per channel).
+    ///                    Blanked by zeroing this region in experiments.
+    ///
+    ///     0x0840–0x0A4F  AF-FFT and additional oscilloscope data.
+    ///
+    ///     0x0B00–0x0FFF  Metadata block:
+    ///                    0x0BF2  span index byte   (& 0x0F → FD CAT index 0–9)
+    ///                    0x0BFC  VFO A freq         BE uint32, Hz
+    ///                    0x0C16  VFO B freq         BE uint32, Hz
+    ///
     ///   Cadence: ~40 ms (~25 frames/second).
     ///
     ///   SEQUENCE COUNTER: uses the session-shared counter (Func&lt;byte&gt; nextSeq)
@@ -96,44 +106,38 @@ namespace RemoteShareManaged
 
         public const int FrameSize = 4096;
 
-        // ── MAIN spectrum — confirmed location (pcapng analysis 2026-06-06) ──────
+        // ── Spectrum ring buffer layout (confirmed 2026-06-07) ──────────────────
         //
-        // The MAIN spectrum lives at a FIXED offset, NOT in a ring buffer.
-        // Confirmed by comparing antenna vs dummy-load captures: this is the only
-        // 400-byte region whose variance is 8–10× higher with a live antenna than
-        // with a dummy load. The entire region is homogeneous and updated every frame.
+        // Ring: 7 rows × 264 bytes = 0x0000–0x0737.
+        // Each row: bytes   0–131 = MAIN SPE (132 bins, single-byte amplitude)
+        //           bytes 132–263 = SUB  SPE (132 bins, single-byte amplitude)
         //
-        // Encoding: two bytes per bin (200 bins × 2 bytes = 400 bytes).
-        //   even byte (frameData[offset + i*2    ]): rises with signal strength
-        //   odd  byte (frameData[offset + i*2 + 1]): falls with signal strength
-        //   noise floor: even ≈ 134, odd ≈ 122  → difference ≈ 12
-        //   strong signal: even ≈ 200, odd ≈ 60  → difference ≈ 140
-        //   display value = Max(0, even - odd)   → 0 at noise, up to ~255 at peak
+        // Single-byte amplitude encoding:
+        //   0   = no signal (or uninitialised)
+        //   ~60 = quiet band noise floor (confirmed: SUB on 40m with no signals)
+        //   ~170-220 = busy FT8 band bins
+        //   255 = maximum signal
         //
-        // Bin 0 = lowest frequency, bin 199 = highest frequency.
-        // Hz per bin = SpanHz / 200.
-        public const int SpeBins       = 200;
-        public const int MainSpeOffset = 0x0768;  // 0x0768..0x08F7 (400 bytes)
-
-        // SUB spectrum offset: not yet confirmed. Pending a capture where both
-        // VFOs are on dummy load (or a moving-carrier test on SUB VFO).
-        // SubSpe is returned as a zero-filled placeholder until this is resolved.
-        // public const int SubSpeOffset = ???;
-
-        // Frequency and span fields in metadata block.
-        // These are stable across frames — not inside any ring.
-        public const int MetadataOffset = 0x0B54;
+        // FastDrawHelper.dll applies MAX-HOLD across all 7 rows for the SPE
+        // display (wf_len=264, 2 px/bin × 132 bins). We do the same.
+        //
+        // SpeBins = 132 per channel. Hz/bin ≈ SpanHz / 132.
+        // Bin 0 = lowest frequency, bin 131 = highest.
+        public const int RingRows     = 7;
+        public const int RingRowBytes = 264;   // 132 MAIN + 132 SUB
+        public const int SpeBins      = 132;   // bins per channel
 
         // VFO frequencies — Big-Endian uint32, Hz. Confirmed from Wireshark.
         public const int MainFreqOffset = 0x0BFC;
-        public const int SubFreqOffset  = 0x0C12;
+        public const int SubFreqOffset  = 0x0C16;  // confirmed 2026-06-06 by byte search in frame_000107
 
         // Span index — lower nibble of byte at SpanIndexOffset = FD_index.
         // Upper nibble varies (0x80 in Yaesu-app pcapng, 0x40 in live testbed session).
         // Lower nibble is stable across both: 0x46 & 0x0F = 6 = FD006 = 100kHz. ✓
         //   frame[SpanIndexOffset] & 0x0F = FD_index
         //   FD_index → span Hz via SpanTableHz[]
-        public const int SpanIndexOffset = 0x0BF2;
+        public const int SpanIndexOffset    = 0x0BF2;  // MAIN span index
+        public const int SubSpanIndexOffset = 0x0C0C;  // SUB  span index (candidate — 0x0C0C & 0x0F = 7 → 200kHz matches Yaesu app)
 
         // FTdx101D span lookup: index i → span in Hz (FD00i CAT command).
         // Confirmed: FD003=10k, FD005=50k, FD006=100k, FD007=200k,
@@ -168,6 +172,17 @@ namespace RemoteShareManaged
         private Task? _receiveTask;
         private int _frameCount;
         private long _nextDiagTick;
+
+        // Decaying max-hold buffers for MAIN and SUB SPE.
+        // Each frame: raise any bin that exceeds its current value; decay all
+        // others by DecayPerFrame. At ~25fps and decay=3, a peak at 220 returns
+        // to noise floor (~80) in ~(220-80)/3 ≈ 47 frames ≈ 1.9 seconds.
+        // This reveals frequency structure that static max-hold buries.
+        // Thread-safety: only touched inside ExtractAndRaise() on receive loop thread.
+        private readonly byte[] _mainDecay = new byte[SpeBins];
+        private readonly byte[] _subDecay  = new byte[SpeBins];
+        private const int DecayPerFrame = 3;
+        private bool _decayInitialised;
 
         // Channel used to hand 0x0E ACK packets from the receive loop to
         // WaitForAckAsync() without blocking the receive loop.
@@ -443,61 +458,136 @@ namespace RemoteShareManaged
             }
             // Bytes [available..FrameSize-1] remain 0 from array initialisation.
 
-            // ── MAIN SPE extraction (fixed offset, confirmed 2026-06-06) ─────────
-            // The MAIN spectrum is at a fixed offset 0x0768..0x08F7 (400 bytes),
-            // NOT in a ring buffer. Encoding: 2 bytes per bin — each pair encodes
-            // signal level around a midpoint of ~128:
-            //   noise floor: even≈134, odd≈122  (even above mid, odd below)
-            //   with signal: even rises further, odd falls further
-            //   e.g. S9+800: even≈175-220, odd≈47-085
-            //   display value = Max(0, even - odd)
-            //   → ~12 at noise (134-122), clamped to 0 after noise floor subtraction
-            //   → ~100-160 at strong signal
-            var mainSpe = new byte[SpeBins];
-            for (int i = 0; i < SpeBins; i++)
-            {
-                int even = frameData[MainSpeOffset + i * 2];
-                int odd  = frameData[MainSpeOffset + i * 2 + 1];
-                mainSpe[i] = (byte)Math.Max(0, even - odd);
-            }
-
-            // SUB SPE: offset not yet confirmed — return zeros as placeholder.
-            // TODO: locate SubSpeOffset from a capture with both VFOs on dummy load
-            // or a moving-carrier test on the SUB VFO.
-            var subSpe = new byte[SpeBins];
-
-            // Frequency and span metadata are stable (not in the ring) — read directly
-            uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
-            uint subFreqHz  = ReadBEUInt32(frameData, SubFreqOffset);
-
-            // Span index: lower nibble of frame[SpanIndexOffset] = FD CAT command index.
-            // Live session shows 0x46 (not 0x86) for FD006 (100kHz): upper nibble varies
-            // between sessions (0x40 in live, 0x80 in pcapng). Lower nibble is stable.
-            int spanIdx = frameData[SpanIndexOffset] & 0x0F;
-            uint spanHz = (uint)spanIdx < (uint)SpanTableHz.Length
-                ? SpanTableHz[spanIdx]
-                : 0;
-
-            // ── Diagnostic: log raw bytes at MainSpeOffset + SPE stats every 5s ─
+            // ── Diagnostic: log raw frame stats every 5s ─────────────────────────
             _frameCount++;
             long now = System.Diagnostics.Stopwatch.GetTimestamp();
             if (now >= _nextDiagTick)
             {
                 _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
-                var sb = new System.Text.StringBuilder();
-                sb.Append($"[SPE diag frame#{_frameCount}] raw[0x{MainSpeOffset:X4}..+11]: ");
-                for (int i = 0; i < 12; i++)
-                    sb.Append($"{frameData[MainSpeOffset + i]:D3} ");
-                int speMin = mainSpe.Min();
-                int speMax = mainSpe.Max();
+                uint diagFreq = ReadBEUInt32(frameData, MainFreqOffset);
+                int  diagSpan = frameData[SpanIndexOffset] & 0x0F;
+                _log.LogInformation(
+                    "[Scope diag frame#{F}] mainFreq={MF} spanIdx={SI}",
+                    _frameCount, diagFreq, diagSpan);
+            }
+
+            ExtractAndRaise(frameData);
+        }
+
+        // -----------------------------------------------------------------------
+        // SPE extraction
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Extract MAIN and SUB SPE arrays using max-hold across all RingRows rows.
+        /// Matches FastDrawHelper.dll behaviour for the Yaesu app's peak-hold display.
+        /// Suitable for waterfall rendering or when consecutive frames are unavailable
+        /// (e.g. first frame after connect, or static replay).
+        /// </summary>
+        private static (byte[] mainSpe, byte[] subSpe) ExtractSpeMaxHold(byte[] frameData)
+        {
+            var mainSpe = new byte[SpeBins];
+            var subSpe  = new byte[SpeBins];
+            for (int row = 0; row < RingRows; row++)
+            {
+                int rowBase = row * RingRowBytes;
+                for (int bin = 0; bin < SpeBins; bin++)
+                {
+                    byte m = frameData[rowBase + bin];
+                    byte s = frameData[rowBase + SpeBins + bin];
+                    if (m > mainSpe[bin]) mainSpe[bin] = m;
+                    if (s > subSpe[bin])  subSpe[bin]  = s;
+                }
+            }
+            return (mainSpe, subSpe);
+        }
+
+        // -----------------------------------------------------------------------
+        // Static-frame replay (for display testing without live radio)
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// Load a saved 4096-byte frame file (e.g. from FastDrawFrames\frame_NNNNNN_avg0.bin)
+        /// and fire FrameReceived once as if it arrived from the network.
+        ///
+        /// Use this to:
+        ///   - Verify that our RawFrame matches the Yaesu app's ScopeRead buffer exactly
+        ///   - Experiment with zeroing frame regions to map display semantics
+        ///   - Compare our rendering against the Yaesu app rendering of identical data
+        ///
+        /// Does NOT require a live session — call any time after construction.
+        /// </summary>
+        public void FireReplayFrame(string binFilePath)
+        {
+            var frameData = File.ReadAllBytes(binFilePath);
+            if (frameData.Length < FrameSize)
+                throw new InvalidDataException(
+                    $"Replay file is {frameData.Length} bytes — expected {FrameSize}");
+
+            // Trim to exactly FrameSize if file is larger
+            if (frameData.Length > FrameSize)
+                Array.Resize(ref frameData, FrameSize);
+
+            ExtractAndRaise(frameData);
+        }
+
+        /// <summary>
+        /// Common extraction logic shared by ProcessScopeFrame (live) and
+        /// FireReplayFrame (static). Fires FrameReceived with the extracted data.
+        /// </summary>
+        private void ExtractAndRaise(byte[] frameData)
+        {
+            // Get max-hold across all 7 ring rows (raw frame values).
+            var (rawMain, rawSub) = ExtractSpeMaxHold(frameData);
+
+            // Apply decaying max-hold: raise any bin that exceeds the current held
+            // value; decay all others toward zero by DecayPerFrame per frame.
+            // This lets FT8 signal peaks persist briefly then fade, revealing genuine
+            // frequency structure that static max-hold buries by saturating all bins.
+            if (!_decayInitialised)
+            {
+                Array.Copy(rawMain, _mainDecay, SpeBins);
+                Array.Copy(rawSub,  _subDecay,  SpeBins);
+                _decayInitialised = true;
+            }
+            for (int i = 0; i < SpeBins; i++)
+            {
+                if (rawMain[i] >= _mainDecay[i])
+                    _mainDecay[i] = rawMain[i];
+                else
+                    _mainDecay[i] = (byte)Math.Max(0, _mainDecay[i] - DecayPerFrame);
+
+                if (rawSub[i] >= _subDecay[i])
+                    _subDecay[i] = rawSub[i];
+                else
+                    _subDecay[i] = (byte)Math.Max(0, _subDecay[i] - DecayPerFrame);
+            }
+
+            // Snapshot decayed values for the event.
+            var mainSpe = (byte[])_mainDecay.Clone();
+            var subSpe  = (byte[])_subDecay.Clone();
+
+            uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
+            uint subFreqHz  = ReadBEUInt32(frameData, SubFreqOffset);
+
+            int  mainSpanIdx = frameData[SpanIndexOffset]    & 0x0F;
+            int  subSpanIdx  = frameData[SubSpanIndexOffset] & 0x0F;
+            uint mainSpanHz  = (uint)mainSpanIdx < (uint)SpanTableHz.Length ? SpanTableHz[mainSpanIdx] : 0;
+            uint subSpanHz   = (uint)subSpanIdx  < (uint)SpanTableHz.Length ? SpanTableHz[subSpanIdx]  : 0;
+
+            if (mainSpe.Length > 0)
+            {
+                int speMin  = mainSpe.Min();
+                int speMax  = mainSpe.Max();
                 double speMean = mainSpe.Average(b => (double)b);
-                sb.Append($"| spe min={speMin} max={speMax} mean={speMean:F1}");
-                sb.Append($" | spanIdx={spanIdx} spanHz={spanHz} mainFreq={mainFreqHz}");
-                _log.LogInformation("{Msg}", sb.ToString());
+                var preview = string.Join(" ", mainSpe.Take(12).Select(b => $"{b:D3}"));
+                _log.LogDebug(
+                    "[SPE] first12: {P} | min={Min} max={Max} mean={Mean:F1} | mainSpan={MSH} subSpan={SSH} mainFreq={MF}",
+                    preview, speMin, speMax, speMean, mainSpanHz, subSpanHz, mainFreqHz);
             }
 
             FrameReceived?.Invoke(new ScopeFrame(
-                mainSpe, subSpe, frameData, mainFreqHz, subFreqHz, spanHz));
+                mainSpe, subSpe, frameData, mainFreqHz, subFreqHz, mainSpanHz, subSpanHz));
         }
 
         // -----------------------------------------------------------------------
@@ -532,18 +622,21 @@ namespace RemoteShareManaged
     public sealed class ScopeFrame
     {
         /// <summary>
-        /// MAIN receiver spectrum — 200 bytes, bin 0 = lowest frequency.
-        /// Amplitude: higher byte value = stronger signal (0 = noise floor).
-        /// Decoded from two-byte pairs at frame offset 0x0768: value = Max(0, odd - even).
-        /// Hz per bin = span_Hz / 200.
+        /// MAIN receiver spectrum — 132 bytes, bin 0 = lowest frequency.
+        /// Each byte is a single-byte amplitude: 0 = no signal, 255 = max.
+        /// Derived by max-hold across all 7 ring rows (bytes 0–131 of each row).
+        /// Typical noise floor: ~60–80 (quiet band), ~170–210 (busy FT8 band).
+        /// Hz per bin ≈ SpanHz / 132.
         /// </summary>
         public byte[] MainSpe
         {
             get;
         }
 
-        /// <summary>SUB receiver spectrum — 200 bytes, same encoding as MainSpe.
-        /// Currently returns zeros (SUB frame offset not yet confirmed).</summary>
+        /// <summary>
+        /// SUB receiver spectrum — 132 bytes, same encoding as MainSpe.
+        /// Derived by max-hold across all 7 ring rows (bytes 132–263 of each row).
+        /// </summary>
         public byte[] SubSpe
         {
             get;
@@ -568,10 +661,17 @@ namespace RemoteShareManaged
         }
 
         /// <summary>
-        /// Scope span in Hz (from frame metadata span index). Zero if unknown.
-        /// Confirmed offsets: FD003=10k, FD005=50k … FD009=1000k.
+        /// MAIN scope span in Hz (from frame metadata at SpanIndexOffset). Zero if unknown.
         /// </summary>
         public uint SpanHz
+        {
+            get;
+        }
+
+        /// <summary>
+        /// SUB scope span in Hz (from frame metadata at SubSpanIndexOffset). Zero if unknown.
+        /// </summary>
+        public uint SubSpanHz
         {
             get;
         }
@@ -582,16 +682,15 @@ namespace RemoteShareManaged
         /// <summary>Convenience: SUB centre frequency in MHz.</summary>
         public double SubFrequencyMHz => SubFrequencyHz / 1_000_000.0;
 
-        /// <summary>
-        /// Hz per spectrum bin (= SpanHz / 200). Zero if span unknown.
-        /// Use for frequency-axis labelling: bin i covers
-        ///   centre ± (i - SpeBins/2) × HzPerBin
-        /// </summary>
+        /// <summary>Hz per MAIN spectrum bin. Zero if span unknown.</summary>
         public double HzPerBin => SpanHz > 0 ? SpanHz / (double)ScopeChannel.SpeBins : 0;
+
+        /// <summary>Hz per SUB spectrum bin. Zero if span unknown.</summary>
+        public double SubHzPerBin => SubSpanHz > 0 ? SubSpanHz / (double)ScopeChannel.SpeBins : 0;
 
         public ScopeFrame(
             byte[] mainSpe, byte[] subSpe, byte[] rawFrame,
-            uint mainFreqHz, uint subFreqHz, uint spanHz)
+            uint mainFreqHz, uint subFreqHz, uint spanHz, uint subSpanHz)
         {
             MainSpe = mainSpe;
             SubSpe = subSpe;
@@ -599,6 +698,7 @@ namespace RemoteShareManaged
             MainFrequencyHz = mainFreqHz;
             SubFrequencyHz = subFreqHz;
             SpanHz = spanHz;
+            SubSpanHz = subSpanHz;
         }
     }
 }
