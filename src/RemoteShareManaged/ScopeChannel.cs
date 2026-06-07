@@ -7,6 +7,8 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Channels;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 
 namespace RemoteShareManaged
@@ -127,17 +129,23 @@ namespace RemoteShareManaged
         public const int RingRowBytes = 264;   // 132 MAIN + 132 SUB
         public const int SpeBins      = 132;   // bins per channel
 
-        // VFO frequencies — Big-Endian uint32, Hz. Confirmed from Wireshark.
+        // VFO frequencies — Big-Endian uint32, Hz.
+        // SUB metadata block is at MAIN metadata block + 0x16 (22 bytes).
+        // Confirmed 2026-06-07 by MetaScan byte dump with MAIN=14.074 SUB=7.074 span=50kHz:
+        //   0x0BFC = 14074000 (MAIN ✓), 0x0C12 = 7074000 (SUB ✓).
+        //   Old SubFreqOffset 0x0C16 was unreliable: correct when MAIN≠SUB band,
+        //   but reads MAIN−span when both VFOs on same band.
         public const int MainFreqOffset = 0x0BFC;
-        public const int SubFreqOffset  = 0x0C16;  // confirmed 2026-06-06 by byte search in frame_000107
+        public const int SubFreqOffset  = 0x0C12;  // confirmed 2026-06-07 (+0x16 from MainFreqOffset)
 
         // Span index — lower nibble of byte at SpanIndexOffset = FD_index.
-        // Upper nibble varies (0x80 in Yaesu-app pcapng, 0x40 in live testbed session).
-        // Lower nibble is stable across both: 0x46 & 0x0F = 6 = FD006 = 100kHz. ✓
-        //   frame[SpanIndexOffset] & 0x0F = FD_index
-        //   FD_index → span Hz via SpanTableHz[]
+        // Upper nibble varies (0x80 in Yaesu-app pcapng, 0x45 in live testbed).
+        // Lower nibble is stable: & 0x0F = FD_index → SpanTableHz[].
+        // SUB span is +0x16 bytes from MAIN span (same 22-byte offset pattern).
+        // Confirmed 2026-06-07: 0x0BF2=0x45 (MAIN, &0F=5=50kHz ✓), 0x0C08=0x45 (SUB, &0F=5=50kHz ✓).
+        //   Old SubSpanIndexOffset 0x0C0C had value 0xF6 → &0F=6=100kHz (wrong).
         public const int SpanIndexOffset    = 0x0BF2;  // MAIN span index
-        public const int SubSpanIndexOffset = 0x0C0C;  // SUB  span index (candidate — 0x0C0C & 0x0F = 7 → 200kHz matches Yaesu app)
+        public const int SubSpanIndexOffset = 0x0C08;  // SUB  span index (confirmed 2026-06-07)
 
         // FTdx101D span lookup: index i → span in Hz (FD00i CAT command).
         // Confirmed: FD003=10k, FD005=50k, FD006=100k, FD007=200k,
@@ -172,17 +180,11 @@ namespace RemoteShareManaged
         private Task? _receiveTask;
         private int _frameCount;
         private long _nextDiagTick;
+        private long _nextSubDiagTick;    // 1-second SUB correlation diagnostic
+        private bool _metaScanDone;       // one-shot metadata scanner
+        private byte[]? _prevFrameData;   // previous frame for delta-based newest-row detection
+        private long[]? _lastRowDeltas;   // per-row deltas from most recent ExtractNewestRow call
 
-        // Decaying max-hold buffers for MAIN and SUB SPE.
-        // Each frame: raise any bin that exceeds its current value; decay all
-        // others by DecayPerFrame. At ~25fps and decay=3, a peak at 220 returns
-        // to noise floor (~80) in ~(220-80)/3 ≈ 47 frames ≈ 1.9 seconds.
-        // This reveals frequency structure that static max-hold buries.
-        // Thread-safety: only touched inside ExtractAndRaise() on receive loop thread.
-        private readonly byte[] _mainDecay = new byte[SpeBins];
-        private readonly byte[] _subDecay  = new byte[SpeBins];
-        private const int DecayPerFrame = 3;
-        private bool _decayInitialised;
 
         // Channel used to hand 0x0E ACK packets from the receive loop to
         // WaitForAckAsync() without blocking the receive loop.
@@ -246,6 +248,7 @@ namespace RemoteShareManaged
                 return Task.CompletedTask;
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _metaScanDone = false;   // re-run scan on every new connection
 
             _udp = new UdpClient(0);  // bind to any local port
 
@@ -458,19 +461,7 @@ namespace RemoteShareManaged
             }
             // Bytes [available..FrameSize-1] remain 0 from array initialisation.
 
-            // ── Diagnostic: log raw frame stats every 5s ─────────────────────────
             _frameCount++;
-            long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (now >= _nextDiagTick)
-            {
-                _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
-                uint diagFreq = ReadBEUInt32(frameData, MainFreqOffset);
-                int  diagSpan = frameData[SpanIndexOffset] & 0x0F;
-                _log.LogInformation(
-                    "[Scope diag frame#{F}] mainFreq={MF} spanIdx={SI}",
-                    _frameCount, diagFreq, diagSpan);
-            }
-
             ExtractAndRaise(frameData);
         }
 
@@ -478,28 +469,42 @@ namespace RemoteShareManaged
         // SPE extraction
         // -----------------------------------------------------------------------
 
+        // Row 6 (the last ring row) is always the freshest instantaneous FFT snapshot.
+        // Rows 0–5 are older max-hold accumulations. Confirmed empirically (2026-06-07):
+        //   row 6 MAIN mean ≈ 158–161  (rows 0–5: 178–188 — saturated max-hold)
+        //   row 6 SUB  mean ≈  54–61  (rows 0–5: 174–187 — old max-hold from prior freq)
+        // The SUB channel being on 8 MHz (quiet noise floor) is only reflected in row 6;
+        // rows 0–5 still carry max-hold residue from earlier SUB frequencies.
+        private const int NewestRingRow = RingRows - 1;   // = 6
+
         /// <summary>
-        /// Extract MAIN and SUB SPE arrays using max-hold across all RingRows rows.
-        /// Matches FastDrawHelper.dll behaviour for the Yaesu app's peak-hold display.
-        /// Suitable for waterfall rendering or when consecutive frames are unavailable
-        /// (e.g. first frame after connect, or static replay).
+        /// Extract MAIN and SUB SPE from the newest ring row (row 6 — always freshest).
+        /// Also fills <paramref name="rowDeltasOut"/> with per-row MAIN-channel deltas
+        /// for diagnostic use (does not affect row selection).
         /// </summary>
-        private static (byte[] mainSpe, byte[] subSpe) ExtractSpeMaxHold(byte[] frameData)
+        private static (int bestRow, byte[] mainSpe, byte[] subSpe) ExtractNewestRow(
+            byte[] frameData, byte[]? prevFrameData, long[]? rowDeltasOut = null)
         {
-            var mainSpe = new byte[SpeBins];
-            var subSpe  = new byte[SpeBins];
-            for (int row = 0; row < RingRows; row++)
+            // Capture per-row deltas for diagnostics only.
+            if (rowDeltasOut != null && prevFrameData != null &&
+                prevFrameData.Length >= RingRows * RingRowBytes)
             {
-                int rowBase = row * RingRowBytes;
-                for (int bin = 0; bin < SpeBins; bin++)
+                for (int row = 0; row < RingRows; row++)
                 {
-                    byte m = frameData[rowBase + bin];
-                    byte s = frameData[rowBase + SpeBins + bin];
-                    if (m > mainSpe[bin]) mainSpe[bin] = m;
-                    if (s > subSpe[bin])  subSpe[bin]  = s;
+                    int rb = row * RingRowBytes;
+                    long delta = 0;
+                    for (int b = 0; b < SpeBins; b++)
+                        delta += Math.Abs(frameData[rb + b] - prevFrameData[rb + b]);
+                    if (row < rowDeltasOut.Length) rowDeltasOut[row] = delta;
                 }
             }
-            return (mainSpe, subSpe);
+
+            int best = NewestRingRow * RingRowBytes;
+            var mainSpe = new byte[SpeBins];
+            var subSpe  = new byte[SpeBins];
+            Array.Copy(frameData, best,           mainSpe, 0, SpeBins);
+            Array.Copy(frameData, best + SpeBins, subSpe,  0, SpeBins);
+            return (NewestRingRow, mainSpe, subSpe);
         }
 
         // -----------------------------------------------------------------------
@@ -537,45 +542,13 @@ namespace RemoteShareManaged
         /// </summary>
         private void ExtractAndRaise(byte[] frameData)
         {
-            // Get max-hold across all 7 ring rows (raw frame values).
-            var (rawMain, rawSub) = ExtractSpeMaxHold(frameData);
-
-            // Baseline subtraction: the ring saturates quickly on a busy band — all
-            // bins reach their historical peak (min ≈ 200 on 20m FT8). Subtracting
-            // the per-channel floor (min across all bins) removes the shared DC
-            // saturation and exposes the differential structure:
-            //   floor-subtracted value = raw[i] - min(raw)
-            //   FT8 signal bin (raw=245, floor=200): 45
-            //   Quiet bin       (raw=202, floor=200):  2
-            // Apply decaying max-hold on the floor-subtracted values.
-            byte mainFloor = rawMain[0]; for (int i = 1; i < SpeBins; i++) if (rawMain[i] < mainFloor) mainFloor = rawMain[i];
-            byte subFloor  = rawSub[0];  for (int i = 1; i < SpeBins; i++) if (rawSub[i]  < subFloor)  subFloor  = rawSub[i];
-
-            if (!_decayInitialised)
-            {
-                // Start from zero so the display builds structure from scratch
-                // rather than inheriting the fully-saturated initial state.
-                _decayInitialised = true;
-            }
-            for (int i = 0; i < SpeBins; i++)
-            {
-                byte m = (byte)(rawMain[i] - mainFloor);
-                byte s = (byte)(rawSub[i]  - subFloor);
-
-                if (m >= _mainDecay[i])
-                    _mainDecay[i] = m;
-                else
-                    _mainDecay[i] = (byte)Math.Max(0, _mainDecay[i] - DecayPerFrame);
-
-                if (s >= _subDecay[i])
-                    _subDecay[i] = s;
-                else
-                    _subDecay[i] = (byte)Math.Max(0, _subDecay[i] - DecayPerFrame);
-            }
-
-            // Snapshot decayed floor-relative values for the event.
-            var mainSpe = (byte[])_mainDecay.Clone();
-            var subSpe  = (byte[])_subDecay.Clone();
+            // Find the newest ring row via frame delta (primary) or variance (fallback).
+            if (_lastRowDeltas == null) _lastRowDeltas = new long[RingRows];
+            var (selectedRow, mainSpe, subSpe) = ExtractNewestRow(frameData, _prevFrameData, _lastRowDeltas);
+            // Save a copy AFTER extraction (so _lastRowDeltas captured real deltas above).
+            if (_prevFrameData == null || _prevFrameData.Length != frameData.Length)
+                _prevFrameData = new byte[frameData.Length];
+            Array.Copy(frameData, _prevFrameData, RingRows * RingRowBytes);
 
             uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
             uint subFreqHz  = ReadBEUInt32(frameData, SubFreqOffset);
@@ -585,15 +558,110 @@ namespace RemoteShareManaged
             uint mainSpanHz  = (uint)mainSpanIdx < (uint)SpanTableHz.Length ? SpanTableHz[mainSpanIdx] : 0;
             uint subSpanHz   = (uint)subSpanIdx  < (uint)SpanTableHz.Length ? SpanTableHz[subSpanIdx]  : 0;
 
-            if (mainSpe.Length > 0)
+            // ── One-shot metadata scanner ────────────────────────────────────────
+            // Scans the entire metadata region (0x0B54-0x0FFF) on the first frame
+            // and logs every BE uint32 value that looks like an HF frequency
+            // (1 MHz – 30 MHz range).  Use this to find the true SubFreqOffset
+            // when the compile-time constant gives the wrong value.
+            if (!_metaScanDone)
             {
-                int speMin  = mainSpe.Min();
-                int speMax  = mainSpe.Max();
-                double speMean = mainSpe.Average(b => (double)b);
-                var preview = string.Join(" ", mainSpe.Take(12).Select(b => $"{b:D3}"));
-                _log.LogDebug(
-                    "[SPE] first12: {P} | min={Min} max={Max} mean={Mean:F1} | mainSpan={MSH} subSpan={SSH} mainFreq={MF}",
-                    preview, speMin, speMax, speMean, mainSpanHz, subSpanHz, mainFreqHz);
+                _metaScanDone = true;
+
+                // 1. HF frequency scan (1–30 MHz as BE uint32)
+                var hits = new System.Text.StringBuilder();
+                for (int off = 0x0B54; off <= 0x0FFC; off++)
+                {
+                    if (off + 3 >= frameData.Length) break;
+                    uint v = ReadBEUInt32(frameData, off);
+                    if (v >= 1_000_000 && v <= 30_000_000)
+                        hits.Append($"  0x{off:X4}={v}");
+                }
+                _log.LogInformation("[MetaScan] HF-range BE-uint32 hits in 0x0B54-0x0FFF:{H}", hits);
+
+                // 2. Span-index byte dump around MAIN span (0x0BF2) and SUB span candidate (0x0C0C).
+                // Looking for bytes whose lower nibble = valid span index (0–9).
+                // MAIN span confirmed at 0x0BF2.  The correct SUB span offset should have
+                // lower nibble matching the SUB scope span set on the radio.
+                // Dump raw hex for 0x0BE0–0x0C20 so we can compare by eye.
+                var spanDump = new System.Text.StringBuilder();
+                for (int off = 0x0BE0; off <= 0x0C20 && off < frameData.Length; off++)
+                    spanDump.Append($"  {off:X4}:{frameData[off]:X2}");
+                _log.LogInformation("[MetaScan] Byte dump 0x0BE0-0x0C20 (MAIN span@0x0BF2, SUB span?): {D}", spanDump);
+                _log.LogInformation("[MetaScan] MAIN span idx={MI} ({MH}Hz)  SUB span idx={SI} ({SH}Hz) [current offsets]",
+                    mainSpanIdx, mainSpanHz, subSpanIdx, subSpanHz);
+            }
+
+            // ── Diagnostic every 5s ──────────────────────────────────────────────
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now >= _nextDiagTick)
+            {
+                _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
+                byte speMin = mainSpe[0], speMax = mainSpe[0];
+                double speSum = 0;
+                for (int i = 0; i < SpeBins; i++)
+                {
+                    if (mainSpe[i] < speMin) speMin = mainSpe[i];
+                    if (mainSpe[i] > speMax) speMax = mainSpe[i];
+                    speSum += mainSpe[i];
+                }
+                double subSum = 0;
+                byte subMin = subSpe[0], subMax = subSpe[0];
+                for (int i = 0; i < SpeBins; i++)
+                {
+                    subSum += subSpe[i];
+                    if (subSpe[i] < subMin) subMin = subSpe[i];
+                    if (subSpe[i] > subMax) subMax = subSpe[i];
+                }
+                // Per-row deltas — captured during ExtractNewestRow (BEFORE prevFrame update,
+                // so these are genuine frame-to-frame differences, not self-comparison).
+                // One row should dominate if the ring is a live cycling buffer.
+                var deltaStr = _lastRowDeltas == null ? "n/a"
+                    : string.Join(" ", _lastRowDeltas.Select((d, i) => $"r{i}:{d}"));
+                _log.LogInformation(
+                    "[Scope diag #{F}] selectedRow={R} MAIN mean={Mean:F0} min={Min} max={Max} | rowDeltas: {D}",
+                    _frameCount, selectedRow, speSum / SpeBins, speMin, speMax, deltaStr);
+
+                // Per-row means — if one row has a very different mean, it's the fresh instantaneous row.
+                var rowMeans = string.Join(" ", Enumerable.Range(0, RingRows)
+                    .Select(row => { double s = 0; int rb = row * RingRowBytes;
+                        for (int b = 0; b < SpeBins; b++) s += frameData[rb + b];
+                        return $"r{row}:{s/SpeBins:F0}"; }));
+                _log.LogInformation("[Scope diag #{F}] rowMeans: {RM}", _frameCount, rowMeans);
+
+                // SUB row means — if MAIN/SUB are separate, one row might show low SUB mean.
+                var subRowMeans = string.Join(" ", Enumerable.Range(0, RingRows)
+                    .Select(row => { double s = 0; int rb = row * RingRowBytes + SpeBins;
+                        for (int b = 0; b < SpeBins; b++) s += frameData[rb + b];
+                        return $"r{row}:{s/SpeBins:F0}"; }));
+                _log.LogInformation("[Scope diag #{F}] subRowMeans(last132): {SR} SUB freq={SF}",
+                    _frameCount, subRowMeans, subFreqHz);
+            }
+
+            // ── 1-second SUB correlation diagnostic ─────────────────────────────
+            // Logs SUB mean+max every second so fluctuations can be correlated
+            // against the 15s FT8 TX/RX cycle.  If subMax rises during FT8 TX
+            // periods the data has real RF content; if it tracks MAIN audio it
+            // suggests the bytes we are reading are not the SUB RF spectrum.
+            if (now >= _nextSubDiagTick)
+            {
+                _nextSubDiagTick = now + System.Diagnostics.Stopwatch.Frequency;
+                double subSum2 = 0; byte subMax2 = 0;
+                for (int i = 0; i < SpeBins; i++)
+                {
+                    subSum2 += subSpe[i];
+                    if (subSpe[i] > subMax2) subMax2 = subSpe[i];
+                }
+                double mainSum2 = 0; byte mainMax2 = 0;
+                for (int i = 0; i < SpeBins; i++)
+                {
+                    mainSum2 += mainSpe[i];
+                    if (mainSpe[i] > mainMax2) mainMax2 = mainSpe[i];
+                }
+                _log.LogInformation(
+                    "[Scope 1s #{F}] MAIN mean={MM:F0} max={MX}  SUB mean={SM:F0} max={SX}  subFreq={SF}",
+                    _frameCount,
+                    mainSum2 / SpeBins, mainMax2,
+                    subSum2  / SpeBins, subMax2, subFreqHz);
             }
 
             FrameReceived?.Invoke(new ScopeFrame(
