@@ -130,6 +130,19 @@ namespace RemoteShareManaged
         public const int SubSpectrumBins   = 846;
         public const int SpeBins           = MainSpectrumBins;  // alias for callers
 
+        // MAIN oscilloscope waveform buffer — offset-binary, 127 = zero crossing.
+        // ~15 kHz sample rate. Confirmed 2026-06-09 by timebase-variation heatmap test.
+        // Bytes 0x0738–0x0767 (48 bytes) are a preamble/header — byte 1895 is always
+        // close to 255, byte 1896 is always close to 128 (zero). Audio starts at 0x0768.
+        public const int OscPreambleStart = 0x0738;  // 1848 — preamble, not audio
+        public const int OscStart         = 0x0768;  // 1896 — first real audio sample
+        public const int OscSamples       = 400;     // 400 samples = ~26.7 ms at 15 kHz
+
+        // MAIN AF-FFT magnitude buffer — 0 = no signal, higher = stronger.
+        // Boundary at 0x08F8 confirmed 2026-06-09.
+        public const int AfFftStart = 0x08F8;  // 2296
+        public const int AfFftBins  = 344;
+
         // VFO frequencies — Big-Endian uint32, Hz.
         // SUB metadata block is at MAIN metadata block + 0x16 (22 bytes).
         // Confirmed 2026-06-07 by MetaScan byte dump with MAIN=14.074 SUB=7.074 span=50kHz:
