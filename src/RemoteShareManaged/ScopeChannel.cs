@@ -71,28 +71,27 @@ namespace RemoteShareManaged
     ///     SCU sends type 0x0E, MID 0x0187 to PC at ~1s intervals.
     ///     PC sends type 0x0E, MID 0x0107 to SCU at ~1s intervals.
     ///
-    ///   SCOPE FRAME LAYOUT (4096 bytes, confirmed from binary analysis 2026-06-07):
+    ///   SCOPE FRAME LAYOUT (4096 bytes, confirmed from heatmap receiver-disable tests 2026-06-09):
     ///
-    ///     0x0000–0x0737  Spectrum ring buffer: 7 rows × 264 bytes = 1848 bytes.
-    ///                    Each row layout: [MAIN: 132 bytes][SUB: 132 bytes].
-    ///                    Single-byte amplitude per bin: higher = stronger signal.
-    ///                    Bin 0 = lowest frequency, bin 131 = highest.
-    ///                    The SCU writes one new row per frame, advancing a circular
-    ///                    write pointer through rows 0–6. The newest row contains the
-    ///                    current instantaneous spectrum; older rows retain recent history.
-    ///                    FastDrawHelper.dll applies max-hold across all 7 rows to render
-    ///                    the SPE display — we do the same.
-    ///                    SpeBins = 132 per channel. Hz/bin ≈ span_Hz / 132.
+    ///     0x0000–0x034D  MAIN spectrum: 846 bytes, one byte per frequency bin.
+    ///                    Encoding INVERTED: lower byte value = stronger signal.
+    ///                    Bin 0 = VFO − span (lowest frequency).
+    ///                    Bin 845 = VFO (highest frequency).
+    ///                    Hz/bin ≈ span_Hz / 846.
     ///
-    ///     0x0738–0x083F  Oscilloscope data (264 bytes per channel).
-    ///                    Blanked by zeroing this region in experiments.
+    ///     0x034E–0x069B  SUB spectrum: 846 bytes, identical encoding.
+    ///                    Bin 0 = SUB VFO − SUB span, bin 845 = SUB VFO.
     ///
-    ///     0x0840–0x0A4F  AF-FFT and additional oscilloscope data.
+    ///     0x069C–0x0737  Padding / unused (156 bytes, typically zero).
     ///
-    ///     0x0B00–0x0FFF  Metadata block:
+    ///     0x0738–0x0A4F  Oscilloscope / AF-FFT data.
+    ///
+    ///     0x0A50–0x0B53  Unknown.
+    ///
+    ///     0x0B54–0x0FFF  Metadata block:
     ///                    0x0BF2  span index byte   (& 0x0F → FD CAT index 0–9)
     ///                    0x0BFC  VFO A freq         BE uint32, Hz
-    ///                    0x0C16  VFO B freq         BE uint32, Hz
+    ///                    0x0C12  VFO B freq         BE uint32, Hz
     ///
     ///   Cadence: ~40 ms (~25 frames/second).
     ///
@@ -108,26 +107,28 @@ namespace RemoteShareManaged
 
         public const int FrameSize = 4096;
 
-        // ── Spectrum ring buffer layout (confirmed 2026-06-07) ──────────────────
+        // ── Spectrum layout (confirmed 2026-06-09 via heatmap receiver-disable tests) ─
         //
-        // Ring: 7 rows × 264 bytes = 0x0000–0x0737.
-        // Each row: bytes   0–131 = MAIN SPE (132 bins, single-byte amplitude)
-        //           bytes 132–263 = SUB  SPE (132 bins, single-byte amplitude)
+        // The frame contains two flat linear spectrum arrays, back-to-back:
         //
-        // Single-byte amplitude encoding:
-        //   0   = no signal (or uninitialised)
-        //   ~60 = quiet band noise floor (confirmed: SUB on 40m with no signals)
-        //   ~170-220 = busy FT8 band bins
-        //   255 = maximum signal
+        //   MAIN: bytes 0x0000–0x034D (846 bytes)
+        //   SUB:  bytes 0x034E–0x069B (846 bytes)
+        //   Pad:  bytes 0x069C–0x0737 (156 bytes, typically zero)
         //
-        // FastDrawHelper.dll applies MAX-HOLD across all 7 rows for the SPE
-        // display (wf_len=264, 2 px/bin × 132 bins). We do the same.
+        // Each byte = amplitude of one frequency bin.
+        // Encoding is INVERTED: lower value = stronger signal.
+        // Bin 0 = VFO − span (lowest frequency in frame).
+        // Bin 845 = VFO (highest frequency = VFO itself).
+        // Hz/bin ≈ SpanHz / 846.
         //
-        // SpeBins = 132 per channel. Hz/bin ≈ SpanHz / 132.
-        // Bin 0 = lowest frequency, bin 131 = highest.
-        public const int RingRows     = 7;
-        public const int RingRowBytes = 264;   // 132 MAIN + 132 SUB
-        public const int SpeBins      = 132;   // bins per channel
+        // NOTE: there is NO ring buffer / row structure in the frame.
+        //   Previous analysis claiming "7 rows × 264 bytes" was incorrect —
+        //   confirmed wrong by heatmap VFO-sweep test 2026-06-09.
+        public const int MainSpectrumStart = 0;
+        public const int MainSpectrumBins  = 846;
+        public const int SubSpectrumStart  = 846;
+        public const int SubSpectrumBins   = 846;
+        public const int SpeBins           = MainSpectrumBins;  // alias for callers
 
         // VFO frequencies — Big-Endian uint32, Hz.
         // SUB metadata block is at MAIN metadata block + 0x16 (22 bytes).
@@ -178,12 +179,9 @@ namespace RemoteShareManaged
         private UdpClient? _udp;
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
-        private int _frameCount;
+        private int  _frameCount;
         private long _nextDiagTick;
-        private long _nextSubDiagTick;    // 1-second SUB correlation diagnostic
-        private bool _metaScanDone;       // one-shot metadata scanner
-        private byte[]? _prevFrameData;   // previous frame for delta-based newest-row detection
-        private long[]? _lastRowDeltas;   // per-row deltas from most recent ExtractNewestRow call
+        private bool _metaScanDone;
 
 
         // Channel used to hand 0x0E ACK packets from the receive loop to
@@ -413,7 +411,7 @@ namespace RemoteShareManaged
                     var response = ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce);
                     try
                     {
-                        _udp?.Client.SendTo(response, RemoteEndPoint);
+                        _udp?.Client?.SendTo(response, RemoteEndPoint);
                     }
                     catch { }
                     break;
@@ -469,42 +467,19 @@ namespace RemoteShareManaged
         // SPE extraction
         // -----------------------------------------------------------------------
 
-        // Row 6 (the last ring row) is always the freshest instantaneous FFT snapshot.
-        // Rows 0–5 are older max-hold accumulations. Confirmed empirically (2026-06-07):
-        //   row 6 MAIN mean ≈ 158–161  (rows 0–5: 178–188 — saturated max-hold)
-        //   row 6 SUB  mean ≈  54–61  (rows 0–5: 174–187 — old max-hold from prior freq)
-        // The SUB channel being on 8 MHz (quiet noise floor) is only reflected in row 6;
-        // rows 0–5 still carry max-hold residue from earlier SUB frequencies.
-        private const int NewestRingRow = RingRows - 1;   // = 6
-
-        /// <summary>
-        /// Extract MAIN and SUB SPE from the newest ring row (row 6 — always freshest).
-        /// Also fills <paramref name="rowDeltasOut"/> with per-row MAIN-channel deltas
-        /// for diagnostic use (does not affect row selection).
-        /// </summary>
-        private static (int bestRow, byte[] mainSpe, byte[] subSpe) ExtractNewestRow(
-            byte[] frameData, byte[]? prevFrameData, long[]? rowDeltasOut = null)
+        // Flat linear read — no ring buffer, no row structure.
+        // MAIN = bytes 0x0000–0x034D (846 bytes).
+        // SUB  = bytes 0x034E–0x069B (846 bytes).
+        // Encoding: lower byte = stronger signal (inverted).
+        // Confirmed 2026-06-09 by VFO-sweep heatmap test: single continuous array,
+        // signal peak moves smoothly as VFO changes — no 264-byte repetition.
+        private static (byte[] mainSpe, byte[] subSpe) ExtractSpectra(byte[] frameData)
         {
-            // Capture per-row deltas for diagnostics only.
-            if (rowDeltasOut != null && prevFrameData != null &&
-                prevFrameData.Length >= RingRows * RingRowBytes)
-            {
-                for (int row = 0; row < RingRows; row++)
-                {
-                    int rb = row * RingRowBytes;
-                    long delta = 0;
-                    for (int b = 0; b < SpeBins; b++)
-                        delta += Math.Abs(frameData[rb + b] - prevFrameData[rb + b]);
-                    if (row < rowDeltasOut.Length) rowDeltasOut[row] = delta;
-                }
-            }
-
-            int best = NewestRingRow * RingRowBytes;
-            var mainSpe = new byte[SpeBins];
-            var subSpe  = new byte[SpeBins];
-            Array.Copy(frameData, best,           mainSpe, 0, SpeBins);
-            Array.Copy(frameData, best + SpeBins, subSpe,  0, SpeBins);
-            return (NewestRingRow, mainSpe, subSpe);
+            var mainSpe = new byte[MainSpectrumBins];
+            var subSpe  = new byte[SubSpectrumBins];
+            Array.Copy(frameData, MainSpectrumStart, mainSpe, 0, MainSpectrumBins);
+            Array.Copy(frameData, SubSpectrumStart,  subSpe,  0, SubSpectrumBins);
+            return (mainSpe, subSpe);
         }
 
         // -----------------------------------------------------------------------
@@ -542,13 +517,7 @@ namespace RemoteShareManaged
         /// </summary>
         private void ExtractAndRaise(byte[] frameData)
         {
-            // Find the newest ring row via frame delta (primary) or variance (fallback).
-            if (_lastRowDeltas == null) _lastRowDeltas = new long[RingRows];
-            var (selectedRow, mainSpe, subSpe) = ExtractNewestRow(frameData, _prevFrameData, _lastRowDeltas);
-            // Save a copy AFTER extraction (so _lastRowDeltas captured real deltas above).
-            if (_prevFrameData == null || _prevFrameData.Length != frameData.Length)
-                _prevFrameData = new byte[frameData.Length];
-            Array.Copy(frameData, _prevFrameData, RingRows * RingRowBytes);
+            var (mainSpe, subSpe) = ExtractSpectra(frameData);
 
             uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
             uint subFreqHz  = ReadBEUInt32(frameData, SubFreqOffset);
@@ -596,72 +565,28 @@ namespace RemoteShareManaged
             if (now >= _nextDiagTick)
             {
                 _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
-                byte speMin = mainSpe[0], speMax = mainSpe[0];
-                double speSum = 0;
-                for (int i = 0; i < SpeBins; i++)
+                byte mainMin = mainSpe[0], mainMax = mainSpe[0];
+                double mainSum = 0;
+                for (int i = 0; i < MainSpectrumBins; i++)
                 {
-                    if (mainSpe[i] < speMin) speMin = mainSpe[i];
-                    if (mainSpe[i] > speMax) speMax = mainSpe[i];
-                    speSum += mainSpe[i];
+                    if (mainSpe[i] < mainMin) mainMin = mainSpe[i];
+                    if (mainSpe[i] > mainMax) mainMax = mainSpe[i];
+                    mainSum += mainSpe[i];
                 }
-                double subSum = 0;
                 byte subMin = subSpe[0], subMax = subSpe[0];
-                for (int i = 0; i < SpeBins; i++)
+                double subSum = 0;
+                for (int i = 0; i < SubSpectrumBins; i++)
                 {
-                    subSum += subSpe[i];
                     if (subSpe[i] < subMin) subMin = subSpe[i];
                     if (subSpe[i] > subMax) subMax = subSpe[i];
-                }
-                // Per-row deltas — captured during ExtractNewestRow (BEFORE prevFrame update,
-                // so these are genuine frame-to-frame differences, not self-comparison).
-                // One row should dominate if the ring is a live cycling buffer.
-                var deltaStr = _lastRowDeltas == null ? "n/a"
-                    : string.Join(" ", _lastRowDeltas.Select((d, i) => $"r{i}:{d}"));
-                _log.LogInformation(
-                    "[Scope diag #{F}] selectedRow={R} MAIN mean={Mean:F0} min={Min} max={Max} | rowDeltas: {D}",
-                    _frameCount, selectedRow, speSum / SpeBins, speMin, speMax, deltaStr);
-
-                // Per-row means — if one row has a very different mean, it's the fresh instantaneous row.
-                var rowMeans = string.Join(" ", Enumerable.Range(0, RingRows)
-                    .Select(row => { double s = 0; int rb = row * RingRowBytes;
-                        for (int b = 0; b < SpeBins; b++) s += frameData[rb + b];
-                        return $"r{row}:{s/SpeBins:F0}"; }));
-                _log.LogInformation("[Scope diag #{F}] rowMeans: {RM}", _frameCount, rowMeans);
-
-                // SUB row means — if MAIN/SUB are separate, one row might show low SUB mean.
-                var subRowMeans = string.Join(" ", Enumerable.Range(0, RingRows)
-                    .Select(row => { double s = 0; int rb = row * RingRowBytes + SpeBins;
-                        for (int b = 0; b < SpeBins; b++) s += frameData[rb + b];
-                        return $"r{row}:{s/SpeBins:F0}"; }));
-                _log.LogInformation("[Scope diag #{F}] subRowMeans(last132): {SR} SUB freq={SF}",
-                    _frameCount, subRowMeans, subFreqHz);
-            }
-
-            // ── 1-second SUB correlation diagnostic ─────────────────────────────
-            // Logs SUB mean+max every second so fluctuations can be correlated
-            // against the 15s FT8 TX/RX cycle.  If subMax rises during FT8 TX
-            // periods the data has real RF content; if it tracks MAIN audio it
-            // suggests the bytes we are reading are not the SUB RF spectrum.
-            if (now >= _nextSubDiagTick)
-            {
-                _nextSubDiagTick = now + System.Diagnostics.Stopwatch.Frequency;
-                double subSum2 = 0; byte subMax2 = 0;
-                for (int i = 0; i < SpeBins; i++)
-                {
-                    subSum2 += subSpe[i];
-                    if (subSpe[i] > subMax2) subMax2 = subSpe[i];
-                }
-                double mainSum2 = 0; byte mainMax2 = 0;
-                for (int i = 0; i < SpeBins; i++)
-                {
-                    mainSum2 += mainSpe[i];
-                    if (mainSpe[i] > mainMax2) mainMax2 = mainSpe[i];
+                    subSum += subSpe[i];
                 }
                 _log.LogInformation(
-                    "[Scope 1s #{F}] MAIN mean={MM:F0} max={MX}  SUB mean={SM:F0} max={SX}  subFreq={SF}",
+                    "[Scope diag #{F}] MAIN mean={MM:F0} min={Mn} max={Mx}  SUB mean={SM:F0} min={Sn} max={Sx}  mainFreq={MF} subFreq={SF}  mainSpan={MS}Hz",
                     _frameCount,
-                    mainSum2 / SpeBins, mainMax2,
-                    subSum2  / SpeBins, subMax2, subFreqHz);
+                    mainSum / MainSpectrumBins, mainMin, mainMax,
+                    subSum  / SubSpectrumBins,  subMin,  subMax,
+                    mainFreqHz, subFreqHz, mainSpanHz);
             }
 
             FrameReceived?.Invoke(new ScopeFrame(
@@ -702,7 +627,7 @@ namespace RemoteShareManaged
         /// <summary>
         /// MAIN receiver spectrum — 132 bytes, bin 0 = lowest frequency.
         /// Each byte is a single-byte amplitude: 0 = no signal, 255 = max.
-        /// Derived by max-hold across all 7 ring rows (bytes 0–131 of each row).
+        /// Derived from the newest ring row (bytes 132–263 of each row = MAIN).
         /// Typical noise floor: ~60–80 (quiet band), ~170–210 (busy FT8 band).
         /// Hz per bin ≈ SpanHz / 132.
         /// </summary>
@@ -713,7 +638,7 @@ namespace RemoteShareManaged
 
         /// <summary>
         /// SUB receiver spectrum — 132 bytes, same encoding as MainSpe.
-        /// Derived by max-hold across all 7 ring rows (bytes 132–263 of each row).
+        /// Derived from the newest ring row (bytes 0–131 of each row = SUB).
         /// </summary>
         public byte[] SubSpe
         {
