@@ -68,6 +68,14 @@ public sealed class ScuSession : IAsyncDisposable
     /// </summary>
     public IObservable<CatMessage> CatMessages => _catSubject.AsObservable();
 
+    private readonly Subject<byte[]> _binaryMeterSubject = new();
+
+    /// <summary>
+    /// Observable stream of raw binary meter responses (e.g. SPM 15-byte packets).
+    /// Fires when the radio responds to a binary poll command such as the SPM meter request.
+    /// </summary>
+    public IObservable<byte[]> BinaryMeterMessages => _binaryMeterSubject.AsObservable();
+
     /// <summary>
     /// Async enumerable of incoming CAT messages.
     /// Alternative consumption style for non-reactive consumers.
@@ -656,11 +664,21 @@ public sealed class ScuSession : IAsyncDisposable
                 if (frame.ZzType == 0x18)
                     continue;
 
-                var cat = DecodeFunCatResponse(frame.Raw);
-                if (cat is not null)
+                // Binary meter responses (e.g. SPM) must be checked first: they end with ';'
+                // so DecodeFunCatResponse would "succeed" and return binary garbage.
+                var binary = DecodeFunBinaryPayload(frame.Raw);
+                if (binary is not null)
                 {
-                    _log.LogDebug("CAT RX: '{Cat}'", cat);
-                    EmitCat(cat);
+                    _binaryMeterSubject.OnNext(binary);
+                }
+                else
+                {
+                    var cat = DecodeFunCatResponse(frame.Raw);
+                    if (cat is not null)
+                    {
+                        _log.LogDebug("CAT RX: '{Cat}'", cat);
+                        EmitCat(cat);
+                    }
                 }
             }
         }
@@ -704,6 +722,55 @@ public sealed class ScuSession : IAsyncDisposable
         var msg = new CatMessage(cat);
         _catSubject.OnNext(msg);
         _catChannel.Writer.TryWrite(msg);
+    }
+
+    /// <summary>
+    /// Decode the FUN-encoded payload from a port 50001 packet and return the
+    /// 15-byte binary meter data if the packet is an SPM response.
+    ///
+    /// SPM serial format: fun[10..24] = "SPM" + 12 meter bytes + BCC, fun[25] = ';'
+    /// (CatFormat.AddData strips the trailing ';' before calling TryParse, so the
+    /// 15-byte payload is fun[10..24] with BCC at fun[24].)
+    ///
+    /// Detection: "SPM" ASCII prefix (0x53 0x50 0x4D) at fun[10..12] plus BCC check.
+    /// Must be called BEFORE DecodeFunCatResponse because the trailing ';' at fun[25]
+    /// would otherwise cause DecodeFunCatResponse to return binary garbage.
+    /// </summary>
+    private static byte[]? DecodeFunBinaryPayload(byte[] raw)
+    {
+        // Need: 8 ZZ header + 10 FUN header + 15 payload + 1 ';' = 34 bytes minimum
+        if (raw.Length < 34)
+            return null;
+
+        byte kl = raw[6], kh = raw[7];
+
+        // Decode only as many bytes as we need (FUN header + 16 bytes of payload+';')
+        const int needed = 26;  // fun[0..25]: 10-byte header + 15-byte payload + ';'
+        var fun = new byte[Math.Min(needed, raw.Length - 8)];
+        for (int i = 0; i < fun.Length; i++)
+            fun[i] = (byte)(((~i + 1) & 0xff) ^ raw[8 + i] ^ kl ^ kh);
+
+        if (fun.Length < needed)
+            return null;
+
+        ushort mid = (ushort)(fun[2] | (fun[3] << 8));
+        if (mid != 0x0185)
+            return null;
+
+        // Must start with "SPM" (0x53 0x50 0x4D) — the binary response command identifier
+        if (fun[10] != 0x53 || fun[11] != 0x50 || fun[12] != 0x4D)
+            return null;
+
+        // Extract 15-byte payload (fun[10..24]) and validate BCC: sum(bytes[0..13]) == bytes[14]
+        var payload = new byte[15];
+        Array.Copy(fun, 10, payload, 0, 15);
+        byte bcc = 0;
+        for (int i = 0; i < 14; i++)
+            bcc += payload[i];
+        if (bcc != payload[14])
+            return null;
+
+        return payload;
     }
 
     private static string? DecodeCatString(byte[] payload)
@@ -848,6 +915,18 @@ public sealed class ScuSession : IAsyncDisposable
     }
 
     /// <summary>
+    /// Send a raw binary payload to the radio via the SCU-LAN10 CAT channel.
+    /// Used for binary poll commands such as the SPM meter request.
+    /// </summary>
+    public ValueTask SendCatBytesAsync(byte[] data, CancellationToken ct = default)
+    {
+        if (!IsConnected || _cat is null)
+            return ValueTask.CompletedTask;
+        _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++_catPktId, data));
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
     /// Send a Yaesu ASCII CAT command to the radio via the SCU-LAN10.
     /// The command is wrapped in a FUN_10003c30-encoded SendCatWrite packet
     /// (same encoding used by SetFrequencyAsync and the Yaesu app itself).
@@ -906,6 +985,7 @@ public sealed class ScuSession : IAsyncDisposable
     {
         await DisconnectAsync();
         _catSubject.OnCompleted();
+        _binaryMeterSubject.OnCompleted();
         _catChannel.Writer.TryComplete();
         _cts.Dispose();
     }
