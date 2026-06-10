@@ -30,16 +30,11 @@ namespace RemoteShareManaged;
 /// </summary>
 public sealed class ScuSession : IAsyncDisposable
 {
-    // ── Configuration ─────────────────────────────────────────────────────────
-
-    private static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(3);
-    private static readonly TimeSpan KeepaliveInterval = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan KeepaliveTimeout = TimeSpan.FromSeconds(2);
-
     // ── State ─────────────────────────────────────────────────────────────────
 
     private readonly ILogger<ScuSession> _log;
     private readonly ILoggerFactory _loggerFactory;
+    private ScuSessionTiming _t = ScuSessionTiming.Default;  // set in ConnectAsync
 
     private RemotePath? _control;
     private RemotePath? _cat;
@@ -107,8 +102,11 @@ public sealed class ScuSession : IAsyncDisposable
         string password,
         bool isFt710 = false,
         AudioQuality audioQuality = AudioQuality.Pcm16k,
+        ScuSessionTiming? timing = null,
         CancellationToken ct = default)
     {
+        _t = timing ?? ScuSessionTiming.Default;
+
         if (IsConnected)
             await DisconnectAsync();
 
@@ -166,7 +164,7 @@ public sealed class ScuSession : IAsyncDisposable
             _catPumpTask = Task.Run(CatPumpAsync, _cts.Token);
 
             // Give CatPump a moment to start, then query initial frequency
-            await Task.Delay(50, ct);
+            await Task.Delay(_t.PostConnectDelayMs, ct);
             SendPollCmd(PollCmd1);
             SendPollCmd(PollCmd2);
             SendCatQuery(FreqQueryCmd);
@@ -202,7 +200,7 @@ public sealed class ScuSession : IAsyncDisposable
         if (_control is not null && _helloAckNonce != 0)
         {
             _control.Send(ZzFrameCodec.BuildLogout(NextSeq(), _helloAckNonce));
-            await Task.Delay(50);  // give SCU time to process before we close
+            await Task.Delay(_t.DisconnectDelayMs);  // give SCU time to process before we close
         }
 
         IsConnected = false;
@@ -224,7 +222,7 @@ public sealed class ScuSession : IAsyncDisposable
             .Select(t => t!);
         try
         {
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(3));
+            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromMilliseconds(_t.StepTimeoutMs));
         }
         catch { /* timeout fine */ }
 
@@ -249,7 +247,7 @@ public sealed class ScuSession : IAsyncDisposable
             byte[] hello = ZzFrameCodec.BuildHello(user, pass, NextSeq());
             _control!.Send(hello);
 
-            var received = await _control.WaitForZzTypeAsync(0x18, StepTimeout, ct);
+            var received = await _control.WaitForZzTypeAsync(0x18, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
             if (received is null)
                 continue;
 
@@ -282,7 +280,7 @@ public sealed class ScuSession : IAsyncDisposable
         // KEY EXCHANGE — only dec[5] is nonce-dependent: nonce ^ 0x06
         _control!.Send(ZzFrameCodec.BuildKeyExchange(NextSeq(), _helloAckNonce));
         _log.LogDebug("KEY EXCHANGE sent (nonce=0x{N:x2}) — waiting for KEY-ACK...", _helloAckNonce);
-        var keyAck = await _control.WaitForZzTypeAsync(0x18, TimeSpan.FromSeconds(10), ct);
+        var keyAck = await _control.WaitForZzTypeAsync(0x18, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
         if (keyAck is null)
         {
             _log.LogError("KEY-ACK not received");
@@ -293,13 +291,13 @@ public sealed class ScuSession : IAsyncDisposable
         // AUTH BLOB — dec[5] = nonce ^ 0x79
         _control.Send(ZzFrameCodec.BuildAuthBlob(NextSeq(), _helloAckNonce));
         _log.LogDebug("AUTH BLOB sent — waiting for AUTH-ACK...");
-        var authAck1 = await _control.WaitForZzTypeAsync(0x1a, TimeSpan.FromSeconds(20), ct);
+        var authAck1 = await _control.WaitForZzTypeAsync(0x1a, TimeSpan.FromMilliseconds(_t.AuthTimeoutMs), ct);
         if (authAck1 is null)
         {
             _log.LogError("AUTH-ACK not received");
             return false;
         }
-        var authAck2 = await _control.WaitForZzTypeAsync(0x1a, TimeSpan.FromSeconds(5), ct);
+        var authAck2 = await _control.WaitForZzTypeAsync(0x1a, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
         _log.LogDebug("AUTH-ACK received ({N} of 2)", authAck2.HasValue ? 2 : 1);
 
         // CONFIG A + B = SendCatOpen ×2 (confirmed from decompiled RemoteShare.dll).
@@ -309,7 +307,7 @@ public sealed class ScuSession : IAsyncDisposable
         _control.Send(ZzFrameCodec.BuildSendCatOpen(NextSeq(), _helloAckNonce));
         _control.Send(ZzFrameCodec.BuildSendCatOpen(NextSeq(), _helloAckNonce));
 
-        var cfgAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(500), ct);
+        var cfgAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(_t.ConfigAckTimeoutMs), ct);
         if (cfgAck is null)
             _log.LogWarning("CONFIG ACK not received — continuing");
 
@@ -319,7 +317,7 @@ public sealed class ScuSession : IAsyncDisposable
         // Without INIT on a cold SCU, RR1$ only gets the 0x18 broadcast, not the
         // 0x10 directed response needed to open the CAT channel.
         _control.Send(ZzFrameCodec.BuildInit(ZzFrameCodec.InitATemplate, NextSeq(), _helloAckNonce, 0x02));
-        var initAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(500), ct);
+        var initAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(_t.ConfigAckTimeoutMs), ct);
         if (initAck is null)
             _log.LogWarning("INIT ACK not received — continuing");
 
@@ -327,7 +325,7 @@ public sealed class ScuSession : IAsyncDisposable
         _control.Send(ZzFrameCodec.BuildInit(ZzFrameCodec.InitCTemplate, NextSeq(), _helloAckNonce, 0x06));
         _control.Send(ZzFrameCodec.BuildInit(ZzFrameCodec.InitDTemplate, NextSeq(), _helloAckNonce, 0x06));
 
-        var finalAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(500), ct);
+        var finalAck = await _control.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(_t.ConfigAckTimeoutMs), ct);
         if (finalAck is null)
             _log.LogWarning("FINAL-ACK not received — continuing");
         else
@@ -357,7 +355,7 @@ public sealed class ScuSession : IAsyncDisposable
         // Step 1: SendDevPortConnect — activates the CAT channel
         _cat!.Send(ZzFrameCodec.BuildSendDevPortConnect(NextSeq(), _helloAckNonce));
 
-        var connAck = await _cat.WaitForZzTypeAsync(0x0e, StepTimeout, ct);
+        var connAck = await _cat.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
         if (connAck is null)
             _log.LogWarning("SendDevPortConnect ACK not received — continuing");
 
@@ -371,14 +369,14 @@ public sealed class ScuSession : IAsyncDisposable
 
         for (int round = 0; round < 2; round++)
         {
-            await Task.Delay(30, ct);  // 30ms before each round (including first)
+            await Task.Delay(_t.CatRoundDelayMs, ct);  // before each round (including first)
             _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++pktId, ps1));
             _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++pktId, ai0));
             _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce, ++pktId, ai));
         }
 
         // Step 3: Wait for 0x10 (UsbCat_ConnectAns) from SCU
-        var catAck = await _cat.WaitForZzTypeAsync(0x10, StepTimeout, ct);
+        var catAck = await _cat.WaitForZzTypeAsync(0x10, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
         if (catAck is null)
             _log.LogWarning("CAT channel 0x10 not received — continuing");
         else
@@ -392,7 +390,7 @@ public sealed class ScuSession : IAsyncDisposable
         _cat.Send(ZzFrameCodec.BuildSendCatConfirm(NextSeq(), _helloAckNonce, 2));
 
         // Drain remaining handshake frames
-        await DrainAny(TimeSpan.FromMilliseconds(100), ct);
+        await DrainAny(TimeSpan.FromMilliseconds(_t.CatDrainMs), ct);
         _catPktId = pktId;  // save for steady-state SendCatWrite calls
 
         _log.LogInformation("CAT channel open");
@@ -413,13 +411,13 @@ public sealed class ScuSession : IAsyncDisposable
         // verbatim; the radio responds JP0101005AFFA52506220808 confirming success.
         // SP has three non-printable bytes and must be sent as a raw byte array.
 
-        await Task.Delay(15, ct);  // brief gap as observed in Yaesu capture
+        await Task.Delay(_t.RoutingStepDelayMs, ct);  // brief gap as observed in Yaesu capture
 
         // Packet 3: AI1 + JP audio routing commands
         SendCatWriteRaw(ref pktId,
             System.Text.Encoding.ASCII.GetBytes("AI1;JP0101;JP0010;JP0710;ID;"));
 
-        await Task.Delay(15, ct);
+        await Task.Delay(_t.RoutingStepDelayMs, ct);
 
         // Packet 4: SP (binary args) + standard state queries
         // SP raw bytes from log: 53 50 72 FF FF 00 (= "SPr" + 0xFF 0xFF 0x13) + ";ST;TS;VS;FR;"
@@ -429,19 +427,19 @@ public sealed class ScuSession : IAsyncDisposable
             .. System.Text.Encoding.ASCII.GetBytes("ST;TS;VS;FR;")
         ]);
 
-        await Task.Delay(15, ct);
+        await Task.Delay(_t.RoutingStepDelayMs, ct);
 
         // Packet 7: spectrum display config + more state
         SendCatWriteRaw(ref pktId,
             System.Text.Encoding.ASCII.GetBytes("RI0;SS05;SS06;FD000;FD001;"));
 
-        await Task.Delay(15, ct);
+        await Task.Delay(_t.RoutingStepDelayMs, ct);
 
         // Packet 8: remaining spectrum config + standard startup queries
         SendCatWriteRaw(ref pktId,
             System.Text.Encoding.ASCII.GetBytes("FD002;FD003;IF;MD0;AN0;"));
 
-        await DrainAny(TimeSpan.FromMilliseconds(200), ct);
+        await DrainAny(TimeSpan.FromMilliseconds(_t.RoutingDrainMs), ct);
         _catPktId = pktId;
 
         _log.LogInformation("Audio routing initialised (JP commands sent)");
@@ -527,7 +525,7 @@ public sealed class ScuSession : IAsyncDisposable
         audioPath.Send(connectFrame2);
         _log.LogDebug("AudioConnect frame 2 sent");
 
-        var connAck = await audioPath.WaitForZzTypeAsync(0x0e, StepTimeout, ct);
+        var connAck = await audioPath.WaitForZzTypeAsync(0x0e, TimeSpan.FromMilliseconds(_t.StepTimeoutMs), ct);
         if (connAck is null)
             _log.LogWarning("Audio SendDevPortConnect ACK not received — continuing");
         else
@@ -546,7 +544,7 @@ public sealed class ScuSession : IAsyncDisposable
 
         if (scope is not null)
         {
-            await scope.SendDevPortConnectAsync(TimeSpan.FromMilliseconds(200), ct);
+            await scope.SendDevPortConnectAsync(TimeSpan.FromMilliseconds(_t.ScopeAckTimeoutMs), ct);
         }
 
         // Duplicate pair — same content sent twice
@@ -554,7 +552,7 @@ public sealed class ScuSession : IAsyncDisposable
         audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
 
         // Give the SCU time to start the RX stream (~40ms observed in capture)
-        await Task.Delay(60, ct);
+        await Task.Delay(_t.AudioSettleMs, ct);
         _log.LogInformation("Audio channel open");
     }
 
@@ -788,7 +786,7 @@ public sealed class ScuSession : IAsyncDisposable
         {
             while (!_cts.Token.IsCancellationRequested)
             {
-                await Task.Delay(KeepaliveInterval, _cts.Token);
+                await Task.Delay(_t.KeepaliveIntervalMs, _cts.Token);
 
                 // Send keepalives to all open ports
                 // NOTE: do NOT send to port 50003 (scope) — the SCU sends ICMP
@@ -801,7 +799,7 @@ public sealed class ScuSession : IAsyncDisposable
                 _cat!.Send(ZzFrameCodec.BuildKeepalive(authenticated: true, seq50001, _helloAckNonce));
 
                 // Port 50000 responds with type 0x0b
-                var ack = await _control.WaitForZzTypeAsync(0x0b, KeepaliveTimeout, _cts.Token);
+                var ack = await _control.WaitForZzTypeAsync(0x0b, TimeSpan.FromMilliseconds(_t.KeepaliveTimeoutMs), _cts.Token);
 
                 if (ack is null)
                 {

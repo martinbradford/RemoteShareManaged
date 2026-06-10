@@ -138,10 +138,25 @@ namespace RemoteShareManaged
         public const int OscStart         = 0x0768;  // 1896 — first real audio sample
         public const int OscSamples       = 400;     // 400 samples = ~26.7 ms at 15 kHz
 
-        // MAIN AF-FFT magnitude buffer — 0 = no signal, higher = stronger.
-        // Boundary at 0x08F8 confirmed 2026-06-09.
-        public const int AfFftStart = 0x08F8;  // 2296
-        public const int AfFftBins  = 344;
+        // MAIN AF-FFT magnitude buffer — INVERTED encoding: lower byte = stronger signal
+        // (same convention as RF spectrum). 0xFF = no signal, 0x00 = maximum.
+        // Preceded by boundary marker: byte 0x06A0=0x01, byte 0x06A1=config (e.g. 0x3D).
+        // Confirmed 2026-06-10 by filter-width and IF-shift heatmap experiments.
+        public const int    AfFftMarkerOffset = 0x06A0;  // 1696 — marker byte, always 0x01
+        public const int    AfFftStart        = 0x06A2;  // 1698 — first magnitude bin
+        public const int    AfFftBins         = 198;     // bytes 1698–1895
+        public const double AfFftHzPerBin     = 22.0;    // confirmed 2026-06-10 via RTTY tone calibration
+        // Total span: 198 × 22 = 4356 Hz ≈ 4.4 kHz (matches Yaesu's 4.0k axis)
+
+        // SUB AF-FFT magnitude buffer — same encoding as MAIN (inverted).
+        // Header: byte 0x08F8 = marker (0x01), byte 0x08F9 = config.
+        // Data: 0x08FA–0x09BF (198 bytes). No 4-byte padding before header
+        // (unlike MAIN which has 4 padding bytes at 0x069C–0x069F).
+        // Confirmed 2026-06-10 by offset-slider sweep: 0x08FA is the clean start.
+        public const int SubAfFftMarkerOffset = 0x08F8;  // 2296 — marker byte, expect 0x01
+        public const int SubAfFftStart        = 0x08FA;  // 2298 — first SUB magnitude bin
+        public const int SubAfFftBins         = 198;     // bytes 2298–2495
+        // Hz/bin and span are the same as MAIN (22 Hz/bin, ~4.4 kHz)
 
         // VFO frequencies — Big-Endian uint32, Hz.
         // SUB metadata block is at MAIN metadata block + 0x16 (22 bytes).
@@ -193,8 +208,6 @@ namespace RemoteShareManaged
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
         private int  _frameCount;
-        private long _nextDiagTick;
-        private bool _metaScanDone;
 
 
         // Channel used to hand 0x0E ACK packets from the receive loop to
@@ -259,7 +272,6 @@ namespace RemoteShareManaged
                 return Task.CompletedTask;
 
             _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            _metaScanDone = false;   // re-run scan on every new connection
 
             _udp = new UdpClient(0);  // bind to any local port
 
@@ -540,67 +552,6 @@ namespace RemoteShareManaged
             uint mainSpanHz  = (uint)mainSpanIdx < (uint)SpanTableHz.Length ? SpanTableHz[mainSpanIdx] : 0;
             uint subSpanHz   = (uint)subSpanIdx  < (uint)SpanTableHz.Length ? SpanTableHz[subSpanIdx]  : 0;
 
-            // ── One-shot metadata scanner ────────────────────────────────────────
-            // Scans the entire metadata region (0x0B54-0x0FFF) on the first frame
-            // and logs every BE uint32 value that looks like an HF frequency
-            // (1 MHz – 30 MHz range).  Use this to find the true SubFreqOffset
-            // when the compile-time constant gives the wrong value.
-            if (!_metaScanDone)
-            {
-                _metaScanDone = true;
-
-                // 1. HF frequency scan (1–30 MHz as BE uint32)
-                var hits = new System.Text.StringBuilder();
-                for (int off = 0x0B54; off <= 0x0FFC; off++)
-                {
-                    if (off + 3 >= frameData.Length) break;
-                    uint v = ReadBEUInt32(frameData, off);
-                    if (v >= 1_000_000 && v <= 30_000_000)
-                        hits.Append($"  0x{off:X4}={v}");
-                }
-                _log.LogInformation("[MetaScan] HF-range BE-uint32 hits in 0x0B54-0x0FFF:{H}", hits);
-
-                // 2. Span-index byte dump around MAIN span (0x0BF2) and SUB span candidate (0x0C0C).
-                // Looking for bytes whose lower nibble = valid span index (0–9).
-                // MAIN span confirmed at 0x0BF2.  The correct SUB span offset should have
-                // lower nibble matching the SUB scope span set on the radio.
-                // Dump raw hex for 0x0BE0–0x0C20 so we can compare by eye.
-                var spanDump = new System.Text.StringBuilder();
-                for (int off = 0x0BE0; off <= 0x0C20 && off < frameData.Length; off++)
-                    spanDump.Append($"  {off:X4}:{frameData[off]:X2}");
-                _log.LogInformation("[MetaScan] Byte dump 0x0BE0-0x0C20 (MAIN span@0x0BF2, SUB span?): {D}", spanDump);
-                _log.LogInformation("[MetaScan] MAIN span idx={MI} ({MH}Hz)  SUB span idx={SI} ({SH}Hz) [current offsets]",
-                    mainSpanIdx, mainSpanHz, subSpanIdx, subSpanHz);
-            }
-
-            // ── Diagnostic every 5s ──────────────────────────────────────────────
-            long now = System.Diagnostics.Stopwatch.GetTimestamp();
-            if (now >= _nextDiagTick)
-            {
-                _nextDiagTick = now + System.Diagnostics.Stopwatch.Frequency * 5;
-                byte mainMin = mainSpe[0], mainMax = mainSpe[0];
-                double mainSum = 0;
-                for (int i = 0; i < MainSpectrumBins; i++)
-                {
-                    if (mainSpe[i] < mainMin) mainMin = mainSpe[i];
-                    if (mainSpe[i] > mainMax) mainMax = mainSpe[i];
-                    mainSum += mainSpe[i];
-                }
-                byte subMin = subSpe[0], subMax = subSpe[0];
-                double subSum = 0;
-                for (int i = 0; i < SubSpectrumBins; i++)
-                {
-                    if (subSpe[i] < subMin) subMin = subSpe[i];
-                    if (subSpe[i] > subMax) subMax = subSpe[i];
-                    subSum += subSpe[i];
-                }
-                _log.LogInformation(
-                    "[Scope diag #{F}] MAIN mean={MM:F0} min={Mn} max={Mx}  SUB mean={SM:F0} min={Sn} max={Sx}  mainFreq={MF} subFreq={SF}  mainSpan={MS}Hz",
-                    _frameCount,
-                    mainSum / MainSpectrumBins, mainMin, mainMax,
-                    subSum  / SubSpectrumBins,  subMin,  subMax,
-                    mainFreqHz, subFreqHz, mainSpanHz);
-            }
 
             FrameReceived?.Invoke(new ScopeFrame(
                 mainSpe, subSpe, frameData, mainFreqHz, subFreqHz, mainSpanHz, subSpanHz));
