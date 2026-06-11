@@ -663,8 +663,8 @@ public static class ZzFrameCodec
     ///   fun[16:18]= 0x0000          unknown
     ///   fun[18]   = 0x01            unknown fixed byte
     ///   fun[19:26]= 0x00 * 7        zero padding
-    ///   fun[26:28]= 0x07d0          playback buffer (2000 ms) LE
-    ///   fun[28:30]= 0x07d0          record buffer  (2000 ms) LE
+    ///   fun[26:28]= playbackLatencyMs LE   default 2000 ms
+    ///   fun[28:30]= recordLatencyMs LE    default 2000 ms
     ///   fun[30]   = 0x64            volume 100
     ///   fun[31]   = 0x64            volume 100
     ///   fun[32:34]= 0x0000          zero
@@ -674,7 +674,9 @@ public static class ZzFrameCodec
     /// </summary>
     public static byte[] BuildSendAudioOpen(byte seq, byte helloAckNonce,
                                              AudioQuality quality = AudioQuality.Pcm16k,
-                                             ushort dev = 2)
+                                             ushort dev = 2,
+                                             ushort playbackLatencyMs = 2000,
+                                             ushort recordLatencyMs = 2000)
     {
         uint sid = (uint)(helloAckNonce ^ 0x08);
         const int dataLen = 28;
@@ -707,12 +709,12 @@ public static class ZzFrameCodec
         // data[12]    = 0x01   unknown fixed byte
         buf[18] = 0x01;
         // data[13:20] = 0x00 * 7 (already zero)
-        // data[20:22] = playback buffer 2000 LE
-        buf[26] = 0xd0;
-        buf[27] = 0x07;
-        // data[22:24] = record buffer 2000 LE
-        buf[28] = 0xd0;
-        buf[29] = 0x07;
+        // data[20:22] = playback buffer LE
+        buf[26] = (byte)playbackLatencyMs;
+        buf[27] = (byte)(playbackLatencyMs >> 8);
+        // data[22:24] = record buffer LE
+        buf[28] = (byte)recordLatencyMs;
+        buf[29] = (byte)(recordLatencyMs >> 8);
         // data[24:26] = volume 100, 100
         buf[30] = 0x64;
         buf[31] = 0x64;

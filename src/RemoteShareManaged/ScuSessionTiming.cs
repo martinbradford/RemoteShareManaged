@@ -82,6 +82,44 @@ namespace RemoteShareManaged
         public int AudioSettleMs       { get; init; } = 60;
 
         /// <summary>
+        /// SCU-side RX (playback) buffer in ms, sent in SendAudioOpen fun[26:28]
+        /// and in every TX audio packet fun[26:28].
+        /// Controls how much audio the SCU buffers before delivering it to the radio.
+        /// Lower values reduce end-to-end latency and help WSJT-X delta-T accuracy.
+        /// Valid range: 100–2000 ms (Yaesu app UI range). Default 500ms.
+        /// </summary>
+        public ushort AudioPlaybackLatencyMs { get; init; } = 500;
+
+        /// <summary>
+        /// SCU-side TX (record) buffer in ms, sent in SendAudioOpen fun[28:30]
+        /// and in every TX audio packet fun[28:30].
+        /// Controls how much TX audio the SCU buffers before transmitting.
+        /// Lower values reduce TX latency. Valid range: 100–2000 ms. Default 500ms.
+        /// </summary>
+        public ushort AudioRecordLatencyMs   { get; init; } = 500;
+
+        /// <summary>
+        /// Drain delay after opening the audio socket, before setting up the
+        /// NAudio chain (ms). Lets the receive loop start and drains any stale
+        /// ICMP Port Unreachable replies. Default 100ms.
+        /// </summary>
+        public int AudioSocketDrainMs        { get; init; } = 100;
+
+        /// <summary>
+        /// NAudio WaveOutEvent desired latency (ms). This is real latency introduced
+        /// by the Windows MME audio stack between the receive pump and the speakers /
+        /// virtual cable. Smaller values directly reduce WSJT-X delta-T.
+        /// Default 150ms. Minimum safe value is ~80ms on most systems.
+        /// </summary>
+        public int WaveOutDesiredLatencyMs   { get; init; } = 150;
+
+        /// <summary>
+        /// Delay after sending the 8k-mode silence trigger frames before starting
+        /// the RX/TX pumps (ms). Default 80ms.
+        /// </summary>
+        public int Audio8kTriggerDelayMs     { get; init; } = 80;
+
+        /// <summary>
         /// Timeout waiting for the scope DevPortConnect ACK before SendAudioOpen.
         /// The ACK typically arrives in 35–86ms. Default 200ms — try 100ms.
         /// </summary>
@@ -112,14 +150,19 @@ namespace RemoteShareManaged
         /// </summary>
         public static readonly ScuSessionTiming Fast = new()
         {
-            CatRoundDelayMs    = 10,
-            CatDrainMs         = 50,
-            RoutingStepDelayMs = 5,
-            RoutingDrainMs     = 50,
-            AudioSettleMs      = 20,
-            ScopeAckTimeoutMs  = 100,
-            PostConnectDelayMs = 20,
-            DisconnectDelayMs  = 20,
+            CatRoundDelayMs      = 10,
+            CatDrainMs           = 50,
+            RoutingStepDelayMs   = 5,
+            RoutingDrainMs       = 50,
+            AudioSettleMs        = 20,
+            ScopeAckTimeoutMs    = 100,
+            PostConnectDelayMs   = 20,
+            DisconnectDelayMs    = 20,
+            AudioPlaybackLatencyMs = 100,
+            AudioRecordLatencyMs   = 100,
+            AudioSocketDrainMs     = 20,
+            WaveOutDesiredLatencyMs = 100,
+            Audio8kTriggerDelayMs  = 40,
         };
 
         /// <summary>
@@ -165,6 +208,13 @@ namespace RemoteShareManaged
             // Keepalive — tighter polling, generous timeout
             KeepaliveIntervalMs = 3_000,
             KeepaliveTimeoutMs  = 5_000,
+
+            // Audio buffers — larger buffers absorb WAN jitter
+            AudioPlaybackLatencyMs  = 1000,
+            AudioRecordLatencyMs    = 1000,
+            AudioSocketDrainMs      = 100,
+            WaveOutDesiredLatencyMs = 300,
+            Audio8kTriggerDelayMs   = 80,
         };
     }
 }

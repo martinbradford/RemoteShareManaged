@@ -95,6 +95,7 @@ public sealed class AudioChannel : IAsyncDisposable
     private readonly AudioQuality _quality;
     private readonly int _waveOutDevice;
     private readonly int _waveInDevice;
+    private readonly ScuSessionTiming _t;
 
     private RemotePath? _path;
     private WaveOutEvent? _waveOut;
@@ -122,7 +123,8 @@ public sealed class AudioChannel : IAsyncDisposable
         AudioQuality quality = AudioQuality.Pcm16k,
         int waveOutDevice = 0,
         int waveInDevice = 0,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        ScuSessionTiming? timing = null)
     {
         _addr = addr;
         _helloAckNonce = helloAckNonce;
@@ -133,6 +135,7 @@ public sealed class AudioChannel : IAsyncDisposable
         _waveInDevice = waveInDevice;
         _loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
         _log = _loggerFactory.CreateLogger<AudioChannel>();
+        _t = timing ?? ScuSessionTiming.Default;
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -147,7 +150,7 @@ public sealed class AudioChannel : IAsyncDisposable
                     _loggerFactory.CreateLogger<RemotePath>());
         _path.Open();
 
-        await Task.Delay(100, ct);
+        await Task.Delay(_t.AudioSocketDrainMs, ct);
 
         var wireFormat = WireFormat;
         _rxBuffer = new BufferedWaveProvider(wireFormat)
@@ -155,7 +158,7 @@ public sealed class AudioChannel : IAsyncDisposable
             BufferDuration = TimeSpan.FromMilliseconds(1000),
             DiscardOnBufferOverflow = true,
         };
-        _waveOut = new WaveOutEvent { DesiredLatency = 500, DeviceNumber = _waveOutDevice };
+        _waveOut = new WaveOutEvent { DesiredLatency = _t.WaveOutDesiredLatencyMs, DeviceNumber = _waveOutDevice };
         _waveOut.Init(_rxBuffer);
         _waveOut.Play();
 
@@ -176,7 +179,7 @@ public sealed class AudioChannel : IAsyncDisposable
             _path.Send(ZzFrameCodec.BuildFunFrame(TxType8k, _nextSeq(), trigger));
             _path.Send(ZzFrameCodec.BuildFunFrame(TxType8k, _nextSeq(), trigger));
             _txFrameSeq++;
-            await Task.Delay(80, ct);
+            await Task.Delay(_t.Audio8kTriggerDelayMs, ct);
         }
 
         _rxPumpTask = Task.Run(RxPumpAsync, _cts.Token);
@@ -455,10 +458,10 @@ public sealed class AudioChannel : IAsyncDisposable
         fun[14] = (byte)(sampleRate & 0xff);
         fun[15] = (byte)(sampleRate >> 8);
         fun[18] = 0x01;
-        fun[26] = 0xd0;
-        fun[27] = 0x07;
-        fun[28] = 0xd0;
-        fun[29] = 0x07;
+        fun[26] = (byte)_t.AudioPlaybackLatencyMs;
+        fun[27] = (byte)(_t.AudioPlaybackLatencyMs >> 8);
+        fun[28] = (byte)_t.AudioRecordLatencyMs;
+        fun[29] = (byte)(_t.AudioRecordLatencyMs >> 8);
         fun[30] = 0x64;
         fun[31] = 0x64;
         // audio_len field present in both 0xa6 and 0xc6 (confirmed from Wireshark)

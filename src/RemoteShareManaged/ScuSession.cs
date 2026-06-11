@@ -556,8 +556,10 @@ public sealed class ScuSession : IAsyncDisposable
         }
 
         // Duplicate pair — same content sent twice
-        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
-        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality));
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality,
+            playbackLatencyMs: _t.AudioPlaybackLatencyMs, recordLatencyMs: _t.AudioRecordLatencyMs));
+        audioPath.Send(ZzFrameCodec.BuildSendAudioOpen(NextSeq(), _helloAckNonce, _audioQuality,
+            playbackLatencyMs: _t.AudioPlaybackLatencyMs, recordLatencyMs: _t.AudioRecordLatencyMs));
 
         // Give the SCU time to start the RX stream (~40ms observed in capture)
         await Task.Delay(_t.AudioSettleMs, ct);
@@ -587,7 +589,7 @@ public sealed class ScuSession : IAsyncDisposable
         return new AudioChannel(
             _addr, _helloAckNonce, NextSeq,
             (path, ct) => DoAudioChannelOpenAsync(path, ct, scope),
-            _audioQuality, waveOutDevice, waveInDevice, loggerFactory);
+            _audioQuality, waveOutDevice, waveInDevice, loggerFactory, _t);
     }
 
     /// <summary>
