@@ -190,9 +190,17 @@ namespace RemoteShareManaged
 
             for (int dy = 0; dy < destHeight; dy++)
             {
+                int destBase = dy * destWidth;
+
+                // Rows not yet filled → black (waterfall fills from the top)
+                if (dy >= filled)
+                {
+                    dest.Slice(destBase, destWidth).Clear();
+                    continue;
+                }
+
                 int age    = dy * filled / destHeight;
                 int srcRow = (newest - age + RowCount) % RowCount;
-                int destBase = dy * destWidth;
                 for (int dx = 0; dx < destWidth; dx++)
                 {
                     int bin = dx * BinCount / destWidth;

@@ -598,7 +598,11 @@ public sealed class ScuSession : IAsyncDisposable
     /// DevPortConnect at the correct moment during audio channel open.
     /// </summary>
     public ScopeChannel CreateScopeChannel(ILoggerFactory? loggerFactory = null)
-        => new ScopeChannel(_addr, _helloAckNonce, NextSeq, loggerFactory ?? _loggerFactory);
+    {
+        var ch = new ScopeChannel(_addr, _helloAckNonce, NextSeq, loggerFactory ?? _loggerFactory);
+        ch.FrameDecimation = _t.ScopeFrameDecimation;
+        return ch;
+    }
 
     // ── Steady-state tasks ────────────────────────────────────────────────────
 

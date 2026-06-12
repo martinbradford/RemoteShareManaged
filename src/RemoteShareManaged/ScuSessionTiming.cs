@@ -130,6 +130,16 @@ namespace RemoteShareManaged
         /// <summary>Delay after sending CAT init query before starting poll loop (ms). Default 50.</summary>
         public int PostConnectDelayMs  { get; init; } = 50;
 
+        /// <summary>
+        /// Render every Nth scope frame; the rest are decoded but not raised.
+        /// 1 = every frame (~25 fps), 2 = ~12 fps, 3 = ~8 fps, 5 = ~5 fps.
+        /// On WAN links, setting this to 3–5 dramatically reduces Dispatcher
+        /// queue pressure without changing the wire bandwidth.
+        /// Applied automatically when CreateScopeChannel() is called.
+        /// Default 1 (full frame rate).
+        /// </summary>
+        public int ScopeFrameDecimation { get; init; } = 1;
+
         /// <summary>Delay before closing the control socket during disconnect (ms). Default 50.</summary>
         public int DisconnectDelayMs   { get; init; } = 50;
 
@@ -184,37 +194,58 @@ namespace RemoteShareManaged
         ///         occasional late ACKs.</item>
         /// </list>
         /// </summary>
+        //public static readonly ScuSessionTiming Wan = new()
+        //{
+        //    // Handshake — every step gets extra headroom for high RTT
+        //    StepTimeoutMs      = 6_000,
+        //    AuthTimeoutMs      = 30_000,
+        //    ConfigAckTimeoutMs = 1_000,
+
+        //    // CAT channel — slower inter-packet cadence, bigger drain windows
+        //    CatRoundDelayMs    = 60,
+        //    CatDrainMs         = 300,
+        //    RoutingStepDelayMs = 30,
+        //    RoutingDrainMs     = 400,
+
+        //    // Audio / scope — more time for the SCU ACK to arrive
+        //    AudioSettleMs      = 100,
+        //    ScopeAckTimeoutMs  = 500,
+
+        //    // Miscellaneous
+        //    PostConnectDelayMs = 100,
+        //    DisconnectDelayMs  = 100,
+
+        //    // Keepalive — tighter polling, generous timeout
+        //    KeepaliveIntervalMs = 3_000,
+        //    KeepaliveTimeoutMs  = 5_000,
+
+        //    // Audio buffers — larger buffers absorb WAN jitter
+        //    AudioPlaybackLatencyMs  = 1000,
+        //    AudioRecordLatencyMs    = 1000,
+        //    AudioSocketDrainMs      = 100,
+        //    WaveOutDesiredLatencyMs = 300,
+        //    Audio8kTriggerDelayMs   = 80,
+
+        //    // Scope — 5 fps (~25 fps ÷ 5) reduces Dispatcher load on slow links
+        //    ScopeFrameDecimation = 5,
+        //};
+
         public static readonly ScuSessionTiming Wan = new()
         {
-            // Handshake — every step gets extra headroom for high RTT
-            StepTimeoutMs      = 6_000,
-            AuthTimeoutMs      = 30_000,
-            ConfigAckTimeoutMs = 1_000,
-
-            // CAT channel — slower inter-packet cadence, bigger drain windows
-            CatRoundDelayMs    = 60,
-            CatDrainMs         = 300,
-            RoutingStepDelayMs = 30,
-            RoutingDrainMs     = 400,
-
-            // Audio / scope — more time for the SCU ACK to arrive
-            AudioSettleMs      = 100,
-            ScopeAckTimeoutMs  = 500,
-
-            // Miscellaneous
-            PostConnectDelayMs = 100,
-            DisconnectDelayMs  = 100,
-
-            // Keepalive — tighter polling, generous timeout
-            KeepaliveIntervalMs = 3_000,
-            KeepaliveTimeoutMs  = 5_000,
-
-            // Audio buffers — larger buffers absorb WAN jitter
-            AudioPlaybackLatencyMs  = 1000,
-            AudioRecordLatencyMs    = 1000,
-            AudioSocketDrainMs      = 100,
-            WaveOutDesiredLatencyMs = 300,
-            Audio8kTriggerDelayMs   = 80,
+            CatRoundDelayMs = 10,
+            CatDrainMs = 50,
+            RoutingStepDelayMs = 5,
+            RoutingDrainMs = 50,
+            AudioSettleMs = 20,
+            ScopeAckTimeoutMs = 100,
+            PostConnectDelayMs = 20,
+            DisconnectDelayMs = 20,
+            AudioPlaybackLatencyMs = 200,
+            AudioRecordLatencyMs = 100,
+            AudioSocketDrainMs = 20,
+            WaveOutDesiredLatencyMs = 200,
+            Audio8kTriggerDelayMs = 40,
+            ScopeFrameDecimation = 0,
         };
     }
 }

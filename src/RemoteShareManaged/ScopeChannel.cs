@@ -208,6 +208,17 @@ namespace RemoteShareManaged
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
         private int  _frameCount;
+        private int  _decimationCounter;
+
+        /// <summary>
+        /// Render every Nth scope frame; the rest are decoded but not raised.
+        /// 1 = every frame (~25 fps), 2 = every other frame (~12 fps),
+        /// 3 = every third frame (~8 fps), etc.
+        /// Reduces UI render load and Dispatcher queue pressure on slow links
+        /// without changing the wire bandwidth (the SCU always sends ~25 fps).
+        /// Safe to change at any time — takes effect on the next received frame.
+        /// </summary>
+        public int FrameDecimation { get; set; } = 1;
 
 
         // Channel used to hand 0x0E ACK packets from the receive loop to
@@ -281,8 +292,10 @@ namespace RemoteShareManaged
                     unchecked((int)0x9800000C),
                     new byte[] { 0, 0, 0, 0 }, null);
 
-            // Allow large reassembled datagrams (4110 bytes per scope frame)
-            _udp.Client.ReceiveBufferSize = 65536;
+            // Large receive buffer reduces fragment drop probability on slow/jittery links.
+            // Each scope frame is 4110 bytes (3 IP fragments); losing any one kills the frame.
+            // 256 KB holds ~62 frames worth of raw UDP data.
+            _udp.Client.ReceiveBufferSize = 256 * 1024;
 
             var localPort = ((IPEndPoint)_udp.Client.LocalEndPoint!).Port;
             _log.LogDebug("ScopeChannel bound to local port {Port}", localPort);
@@ -542,6 +555,16 @@ namespace RemoteShareManaged
         /// </summary>
         private void ExtractAndRaise(byte[] frameData)
         {
+            // Decimation: raise FrameReceived only on every Nth frame.
+            // Counter increments on every call so the skip is evenly distributed.
+            int n = FrameDecimation;
+            if (n > 1)
+            {
+                _decimationCounter = (_decimationCounter + 1) % n;
+                if (_decimationCounter != 0)
+                    return;
+            }
+
             var (mainSpe, subSpe) = ExtractSpectra(frameData);
 
             uint mainFreqHz = ReadBEUInt32(frameData, MainFreqOffset);
@@ -551,7 +574,6 @@ namespace RemoteShareManaged
             int  subSpanIdx  = frameData[SubSpanIndexOffset] & 0x0F;
             uint mainSpanHz  = (uint)mainSpanIdx < (uint)SpanTableHz.Length ? SpanTableHz[mainSpanIdx] : 0;
             uint subSpanHz   = (uint)subSpanIdx  < (uint)SpanTableHz.Length ? SpanTableHz[subSpanIdx]  : 0;
-
 
             FrameReceived?.Invoke(new ScopeFrame(
                 mainSpe, subSpe, frameData, mainFreqHz, subFreqHz, mainSpanHz, subSpanHz));
