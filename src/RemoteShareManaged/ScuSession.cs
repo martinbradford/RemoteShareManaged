@@ -943,7 +943,7 @@ public sealed class ScuSession : IAsyncDisposable
         if (!IsConnected || _cat is null)
             return ValueTask.CompletedTask;
 
-        _log.LogInformation("SendCat: '{Cmd}'", command);
+        _log.LogDebug("SendCat: '{Cmd}'", command);
         _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce,
                                                   ++_catPktId,
                                                   System.Text.Encoding.ASCII.GetBytes(command)));
@@ -960,7 +960,7 @@ public sealed class ScuSession : IAsyncDisposable
         // Format: FA0<8 digits>; (12 chars total), e.g. 14350125 Hz → "FA014350125;"
         string prefix = vfoB ? "FB0" : "FA0";
         string cmd = prefix + (freqHz % 100_000_000).ToString("D8") + ";";
-        _log.LogInformation("SetFrequency: {Cmd}", cmd);
+        _log.LogDebug("SetFrequency: {Cmd}", cmd);
         // Use SendCatWrite (FUN format) — same encoding used by Yaesu app
         _cat.Send(ZzFrameCodec.BuildSendCatWrite(NextSeq(), _helloAckNonce,
                                                   ++_catPktId,
