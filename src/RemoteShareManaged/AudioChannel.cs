@@ -140,11 +140,25 @@ public sealed class AudioChannel : IAsyncDisposable
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
+    private void ValidateDevices()
+    {
+        if (_waveOutDevice < -1 || _waveOutDevice >= NAudio.Wave.WaveOut.DeviceCount)
+            throw new ArgumentOutOfRangeException(nameof(_waveOutDevice),
+                $"WaveOut device {_waveOutDevice} is invalid " +
+                $"(valid: 0–{NAudio.Wave.WaveOut.DeviceCount - 1}, or -1 for default).");
+
+        if (_waveInDevice < -1 || _waveInDevice >= NAudio.Wave.WaveIn.DeviceCount)
+            throw new ArgumentOutOfRangeException(nameof(_waveInDevice),
+                $"WaveIn device {_waveInDevice} is invalid " +
+                $"(valid: 0–{NAudio.Wave.WaveIn.DeviceCount - 1}, or -1 for default).");
+    }
+
     public async Task StartAsync(CancellationToken ct = default)
     {
         if (IsRunning)
             return;
 
+        ValidateDevices();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         _path = new RemotePath(_addr, ScuPorts.Audio,
                     _loggerFactory.CreateLogger<RemotePath>());

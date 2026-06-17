@@ -18,7 +18,6 @@
   <ItemGroup>
     <PackageReference Include="FluentAssertions" Version="8.10.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
-    <PackageReference Include="NAudio" Version="2.3.0" />
     <PackageReference Include="System.Reactive" Version="6.1.0" />
     <PackageReference Include="xunit.extensibility.core" Version="2.9.3" />
   </ItemGroup>
@@ -28,5 +27,6 @@
       <HintPath>..\SCULAN10Remote\NAudio.dll</HintPath>
     </Reference>
   </ItemGroup>
+
 
 </Project>
