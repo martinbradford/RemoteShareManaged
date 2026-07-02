@@ -247,5 +247,23 @@ namespace RemoteShareManaged
             Audio8kTriggerDelayMs = 40,
             ScopeFrameDecimation = 0,
         };
+
+        public static readonly ScuSessionTiming Lan = new()
+        {
+            CatRoundDelayMs = 10,
+            CatDrainMs = 50,
+            RoutingStepDelayMs = 5,
+            RoutingDrainMs = 50,
+            AudioSettleMs = 20,
+            ScopeAckTimeoutMs = 100,
+            PostConnectDelayMs = 20,
+            DisconnectDelayMs = 20,
+            AudioPlaybackLatencyMs = 100,
+            AudioRecordLatencyMs = 100,
+            AudioSocketDrainMs = 20,
+            WaveOutDesiredLatencyMs = 100,
+            Audio8kTriggerDelayMs = 40,
+            ScopeFrameDecimation = 0,
+        };
     }
 }
