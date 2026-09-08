@@ -8,20 +8,32 @@
     <LangVersion>latest</LangVersion>
     <RootNamespace>RemoteShareManaged</RootNamespace>
     <AssemblyName>RemoteShareManaged</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata (review before first publish) -->
+  <PropertyGroup>
+    <PackageId>RemoteShareManaged</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Martin Bradford</Authors>
+    <Description>A .NET library implementing the client interface to the SCU-LAN10 remote controller: CAT command control, bidirectional audio streaming, and spectrum/waterfall data for amateur radio. Windows-only (uses WinMM audio).</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/martinbradford/RemoteShareManaged</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/martinbradford/RemoteShareManaged</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>scu-lan10;amateur-radio;ham-radio;cat-control;audio-streaming;sdr</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile Remove="CodecTests.cs" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="FluentAssertions" Version="8.10.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.8" />
     <PackageReference Include="System.Reactive" Version="6.1.0" />
-    <PackageReference Include="xunit.extensibility.core" Version="2.9.3" />
     <PackageReference Include="NAudio" Version="2.3.0" />
     <PackageReference Include="NAudio.WinMM" Version="2.3.0" />
   </ItemGroup>
-
 
 </Project>

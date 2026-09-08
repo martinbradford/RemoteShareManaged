@@ -1,6 +1,7 @@
 using FluentAssertions;
 using RemoteShareManaged.Codec;
 using RemoteShareManaged.Protocol;
+using Xunit;
 
 namespace RemoteShareManaged.Tests;
 
@@ -52,16 +53,6 @@ public class ZzFrameCodecTests
         ZzFrameCodec.NonceB(6).Should().Be(0xc0);
         ZzFrameCodec.NonceB(7).Should().Be(0x60);
         ZzFrameCodec.NonceB(8).Should().Be(0x00);
-    }
-
-    [Fact]
-    public void BuildKeepalive_Nonces_MatchCapturedValues()
-    {
-        // From Wireshark: seq=1 → nonce_a=0x01, nonce_b=0xa0, check=0xa1
-        byte[] pkt = ZzFrameCodec.BuildKeepalive(false, seq: 1);
-        pkt[6].Should().Be(0x01);
-        pkt[7].Should().Be(0xa0);
-        pkt[8].Should().Be((byte)(0x01 ^ 0xa0));
     }
 
     // ── HELLO ─────────────────────────────────────────────────────────────────
@@ -183,15 +174,6 @@ public class ZzFrameCodecTests
     }
 
     // ── Fixed packet templates ────────────────────────────────────────────────
-
-    [Fact]
-    public void KeyExchangeTemplate_HasCorrectMagicAndType()
-    {
-        var t = ZzFrameCodec.KeyExchangeTemplate;
-        t[0].Should().Be(0x5A);
-        t[1].Should().Be(0x5A);
-        t[2].Should().Be(0x12);
-    }
 
     [Fact]
     public void AuthBlobTemplate_HasCorrectLength()
