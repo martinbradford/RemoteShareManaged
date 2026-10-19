@@ -180,6 +180,10 @@ public sealed class AudioChannel : IAsyncDisposable
         {
             WaveFormat = wireFormat,
             BufferMilliseconds = 10,
+            // 10 ms buffers with NAudio's default of 3 leave only 30 ms of slack
+            // before the capture driver drops audio; extra buffers add headroom
+            // without adding latency (callbacks still fire every 10 ms).
+            NumberOfBuffers = 8,
             DeviceNumber = _waveInDevice,
         };
 
@@ -398,36 +402,37 @@ public sealed class AudioChannel : IAsyncDisposable
         byte[] wireBuf = new byte[txWireBytes];
         int fill = 0;
 
+        // Paced by the capture device clock: a frame is sent as soon as a full
+        // frame of mic audio has accumulated. Do NOT pace with a timer — a 10 ms
+        // PeriodicTimer actually ticks at ~64 Hz on Windows (15.6 ms timer
+        // granularity), so the old timer-driven pump under-fed the SCU and
+        // dropped/zero-filled frames, producing periodic clicks on TX audio.
         try
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(10));
-            while (await timer.WaitForNextTickAsync(_cts.Token))
+            await foreach (var chunk in micCh.Reader.ReadAllAsync(_cts.Token))
             {
-                while (fill < txPcmAccum && micCh.Reader.TryRead(out var chunk))
+                int offset = 0;
+                while (offset < chunk.Length)
                 {
-                    int copy = Math.Min(chunk.Length, txPcmAccum - fill);
-                    Buffer.BlockCopy(chunk, 0, acc, fill, copy);
+                    int copy = Math.Min(chunk.Length - offset, txPcmAccum - fill);
+                    Buffer.BlockCopy(chunk, offset, acc, fill, copy);
+                    offset += copy;
                     fill += copy;
-                }
 
-                if (fill >= txPcmAccum)
-                {
+                    if (fill < txPcmAccum)
+                        break;
+
                     if (isULaw)
                         YaesuMuLaw.Encode(acc, txPcmAccum, wireBuf);
                     else
                         Buffer.BlockCopy(acc, 0, wireBuf, 0, txWireBytes);
-                    acc = new byte[txPcmAccum];
                     fill = 0;
-                }
-                else
-                {
-                    Array.Clear(wireBuf, 0, txWireBytes);
-                }
 
-                byte[] funPayload = BuildTxFunPayload(wireBuf);
-                _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
-                _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
-                _txFrameSeq++;
+                    byte[] funPayload = BuildTxFunPayload(wireBuf);
+                    _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
+                    _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
+                    _txFrameSeq++;
+                }
             }
         }
         catch (OperationCanceledException) { }
@@ -466,7 +471,11 @@ public sealed class AudioChannel : IAsyncDisposable
         fun[9] = (byte)(sid >> 24);
 
         fun[10] = (byte)(_txFrameSeq & 0xff);
-        fun[11] = is8k ? (byte)0x43 : (byte)0x71;  // fixed constant (confirmed from Yaesu reference capture)
+        // High byte of the 16-bit frame counter — NOT a constant. Yaesu captures
+        // show it incrementing every 256 frames (e.g. 0x75→0x76→0x77 at 2.56 s
+        // intervals). Freezing it made the counter jump backwards on every
+        // low-byte wrap, which the SCU played out as a click every ~5.12 s.
+        fun[11] = (byte)(_txFrameSeq >> 8);
         fun[12] = format;  // SCU mirrors format byte in RX packet type selection
         fun[13] = 0x02;
         fun[14] = (byte)(sampleRate & 0xff);

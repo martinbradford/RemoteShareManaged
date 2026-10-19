@@ -207,6 +207,7 @@ namespace RemoteShareManaged
         private UdpClient? _udp;
         private CancellationTokenSource _cts = new();
         private Task? _receiveTask;
+        private Task? _keepaliveTask;
         private int  _frameCount;
         private int  _decimationCounter;
 
@@ -363,6 +364,10 @@ namespace RemoteShareManaged
             // capture used ~50ms between scope DevPortConnect and SendAudioOpen even
             // when the ACK arrived quickly at ~35ms.
             await Task.Delay(50, ct);
+
+            // Connected — start the 1 s keepalive (the Yaesu app's first one follows
+            // the connect by ~0.8 s).
+            _keepaliveTask ??= KeepaliveLoopAsync(_cts.Token);
         }
 
         public async Task StopAsync()
@@ -382,6 +387,16 @@ namespace RemoteShareManaged
                 }
                 catch { }
                 _receiveTask = null;
+            }
+
+            if (_keepaliveTask is not null)
+            {
+                try
+                {
+                    await _keepaliveTask.WaitAsync(TimeSpan.FromSeconds(3));
+                }
+                catch { }
+                _keepaliveTask = null;
             }
 
             _udp = null;
@@ -439,21 +454,59 @@ namespace RemoteShareManaged
                     break;
 
                 case 0x0E:
-                    // Could be either the DevPortConnect ACK or a steady-state keepalive.
-                    // Feed into _ackChannel so SendDevPortConnectAsync can consume it.
-                    // After the connect phase keepalives arrive at ~1s intervals, so the
-                    // channel won't fill up in normal operation.
+                    // Either the DevPortConnect ACK or the SCU's ACK (MID 0x0187) to one of
+                    // our periodic keepalives. Feed into _ackChannel so
+                    // SendDevPortConnectAsync can consume it (DropOldest — harmless if unread).
                     _ackChannel.Writer.TryWrite(raw);
 
-                    // Respond with MID 0x0107 keepalive
-                    var response = ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce);
-                    try
+                    // Do NOT answer ACKs. Replying to every 0x0187 with a 0x0107 made the
+                    // SCU ACK the reply, and so on — a ~667 packet/s ping-pong on 50003
+                    // that loaded the SCU and caused periodic dropouts in TX audio. The
+                    // Yaesu app only sends a keepalive every ~1 s (KeepaliveLoopAsync).
+                    // Only answer a genuine keepalive request from the SCU, should one come.
+                    if (raw.Length >= 12 && DecodeMid(raw) == 0x0107)
                     {
-                        _udp?.Client?.SendTo(response, RemoteEndPoint);
+                        try
+                        {
+                            _udp?.Client?.SendTo(
+                                ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce),
+                                RemoteEndPoint);
+                        }
+                        catch { }
                     }
-                    catch { }
                     break;
             }
+        }
+
+        private static int DecodeMid(byte[] raw)
+        {
+            byte kl = raw[6], kh = raw[7];
+            return (((-2) & 0xff) ^ raw[10] ^ kl ^ kh)
+                 | ((((-3) & 0xff) ^ raw[11] ^ kl ^ kh) << 8);
+        }
+
+        // Scope-port keepalive (MID 0x0107), one per second — matches the Yaesu
+        // reference capture (~1.01 s cadence, each answered by a single 0x0187 ACK).
+        private async Task KeepaliveLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+                while (await timer.WaitForNextTickAsync(ct))
+                {
+                    try
+                    {
+                        _udp?.Client?.SendTo(
+                            ZzFrameCodec.BuildScopeKeepalive(_nextSeq(), _helloAckNonce),
+                            RemoteEndPoint);
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        _log.LogDebug("Scope keepalive send failed: {Msg}", ex.Message);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
         }
 
         private void ProcessScopeFrame(byte[] raw)
