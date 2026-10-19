@@ -24,8 +24,11 @@ namespace RemoteShareManaged
     {
         // ── Steady-state ─────────────────────────────────────────────────────
 
-        /// <summary>Keepalive send interval on port 50000 (ms). Default 5000.</summary>
-        public int KeepaliveIntervalMs { get; init; } = 5_000;
+        /// <summary>
+        /// Keepalive send interval on ports 50000/50001 (ms). Default 1000, the
+        /// Yaesu app's cadence.
+        /// </summary>
+        public int KeepaliveIntervalMs { get; init; } = 1_000;
 
         /// <summary>Keepalive response timeout (ms). Default 2000.</summary>
         public int KeepaliveTimeoutMs  { get; init; } = 2_000;
@@ -85,18 +88,19 @@ namespace RemoteShareManaged
         /// SCU-side RX (playback) buffer in ms, sent in SendAudioOpen fun[26:28]
         /// and in every TX audio packet fun[26:28].
         /// Controls how much audio the SCU buffers before delivering it to the radio.
-        /// Lower values reduce end-to-end latency and help WSJT-X delta-T accuracy.
-        /// Valid range: 100–2000 ms (Yaesu app UI range). Default 500ms.
+        /// Valid range: 100–2000 ms (Yaesu app UI range). Default 2000 ms — what the
+        /// Yaesu app sends (capture 2026-10-19); in testing it did not add audible delay.
         /// </summary>
-        public ushort AudioPlaybackLatencyMs { get; init; } = 500;
+        public ushort AudioPlaybackLatencyMs { get; init; } = 2000;
 
         /// <summary>
         /// SCU-side TX (record) buffer in ms, sent in SendAudioOpen fun[28:30]
         /// and in every TX audio packet fun[28:30].
         /// Controls how much TX audio the SCU buffers before transmitting.
-        /// Lower values reduce TX latency. Valid range: 100–2000 ms. Default 500ms.
+        /// Valid range: 100–2000 ms. Default 2000 ms, matching the Yaesu app
+        /// (behaves as a maximum, not a fixed delay — key-up latency stays &lt;1 s).
         /// </summary>
-        public ushort AudioRecordLatencyMs   { get; init; } = 500;
+        public ushort AudioRecordLatencyMs   { get; init; } = 2000;
 
         /// <summary>
         /// Drain delay after opening the audio socket, before setting up the
@@ -168,8 +172,6 @@ namespace RemoteShareManaged
             ScopeAckTimeoutMs    = 100,
             PostConnectDelayMs   = 20,
             DisconnectDelayMs    = 20,
-            AudioPlaybackLatencyMs = 100,
-            AudioRecordLatencyMs   = 100,
             AudioSocketDrainMs     = 20,
             WaveOutDesiredLatencyMs = 100,
             Audio8kTriggerDelayMs  = 40,
@@ -240,8 +242,6 @@ namespace RemoteShareManaged
             ScopeAckTimeoutMs = 100,
             PostConnectDelayMs = 20,
             DisconnectDelayMs = 20,
-            AudioPlaybackLatencyMs = 200,
-            AudioRecordLatencyMs = 100,
             AudioSocketDrainMs = 20,
             WaveOutDesiredLatencyMs = 200,
             Audio8kTriggerDelayMs = 40,
@@ -258,8 +258,6 @@ namespace RemoteShareManaged
             ScopeAckTimeoutMs = 100,
             PostConnectDelayMs = 20,
             DisconnectDelayMs = 20,
-            AudioPlaybackLatencyMs = 100,
-            AudioRecordLatencyMs = 100,
             AudioSocketDrainMs = 20,
             WaveOutDesiredLatencyMs = 100,
             Audio8kTriggerDelayMs = 40,

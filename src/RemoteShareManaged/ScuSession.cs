@@ -861,15 +861,11 @@ public sealed class ScuSession : IAsyncDisposable
             {
                 await Task.Delay(_t.KeepaliveIntervalMs, _cts.Token);
 
-                // Send keepalives to all open ports
-                // NOTE: do NOT send to port 50003 (scope) — the SCU sends ICMP
-                // Port Unreachable back to us, which corrupts the session state.
-                // Scope is not yet supported.
-                byte seq50000 = NextSeq();
-                byte seq50001 = NextSeq();
-
-                _control!.Send(ZzFrameCodec.BuildKeepalive(false, seq50000));
-                _cat!.Send(ZzFrameCodec.BuildKeepalive(authenticated: true, seq50001, _helloAckNonce));
+                // Steady-state keepalives on 50000 (dev 0) and 50001 (dev 1), in the
+                // same MID 0x0107 format and ~1 s cadence as the Yaesu app. The scope
+                // port (50003, dev 6) keeps itself alive in ScopeChannel.
+                _control!.Send(ZzFrameCodec.BuildDeviceKeepalive(NextSeq(), _helloAckNonce, dev: 0));
+                _cat!.Send(ZzFrameCodec.BuildDeviceKeepalive(NextSeq(), _helloAckNonce, dev: 1));
 
                 // Port 50000 responds with type 0x0b
                 var ack = await _control.WaitForZzTypeAsync(0x0b, TimeSpan.FromMilliseconds(_t.KeepaliveTimeoutMs), _cts.Token);

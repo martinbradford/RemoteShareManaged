@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using NAudio.Wave;
@@ -104,7 +103,6 @@ public sealed class AudioChannel : IAsyncDisposable
 
     private CancellationTokenSource _cts = new();
     private Task? _rxPumpTask;
-    private Task? _txPumpTask;
 
     private ushort _txFrameSeq;  // 16-bit: fun[10]=low byte, fun[11]=high byte
 
@@ -179,11 +177,9 @@ public sealed class AudioChannel : IAsyncDisposable
         _waveIn = new WaveInEvent
         {
             WaveFormat = wireFormat,
+            // 10 ms buffers, NAudio's default buffer count — the same as the
+            // Yaesu app (frmTopMain.audioSessionThread_Start).
             BufferMilliseconds = 10,
-            // 10 ms buffers with NAudio's default of 3 leave only 30 ms of slack
-            // before the capture driver drops audio; extra buffers add headroom
-            // without adding latency (callbacks still fire every 10 ms).
-            NumberOfBuffers = 8,
             DeviceNumber = _waveInDevice,
         };
 
@@ -201,7 +197,7 @@ public sealed class AudioChannel : IAsyncDisposable
         }
 
         _rxPumpTask = Task.Run(RxPumpAsync, _cts.Token);
-        _txPumpTask = Task.Run(TxPumpAsync, _cts.Token);
+        StartTx();
 
         _log.LogInformation("AudioChannel started — {Quality} ({Rate} Hz stereo)",
             _quality, wireFormat.SampleRate);
@@ -224,13 +220,14 @@ public sealed class AudioChannel : IAsyncDisposable
             _path = null;
         }
 
-        var tasks = new[] { _rxPumpTask, _txPumpTask }
-            .Where(t => t is not null).Select(t => t!);
-        try
+        if (_rxPumpTask is not null)
         {
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(3));
+            try
+            {
+                await _rxPumpTask.WaitAsync(TimeSpan.FromSeconds(3));
+            }
+            catch { }
         }
-        catch { }
 
         _waveOut?.Dispose();
         _waveOut = null;
@@ -373,49 +370,45 @@ public sealed class AudioChannel : IAsyncDisposable
         _rxBuffer!.AddSamples(pcm, 0, len);
     }
 
-    // ── TX pump ───────────────────────────────────────────────────────────────
+    // ── TX ────────────────────────────────────────────────────────────────────
 
-    private async Task TxPumpAsync()
+    /// <summary>
+    /// Send mic audio straight from the WaveIn callback, as the Yaesu app does
+    /// (frmTopMain.myRecorder_DataAvailable → SendAudioWave). Each 10 ms capture
+    /// buffer goes out as soon as it is recorded, so the send cadence is the
+    /// capture device's own steady 10 ms tick.
+    ///
+    /// History: a timer-driven pump (10 ms PeriodicTimer, really ~64 Hz on
+    /// Windows) under-fed the SCU and caused clicks; its replacement handed each
+    /// buffer through a Channel to an async task, which on a busy thread pool
+    /// woke late and sent frames in back-to-back pairs (0 ms / 20 ms) — on-air
+    /// slips noticeably worse than the Yaesu app on the same capture device.
+    /// </summary>
+    private void StartTx()
     {
-        _log.LogDebug("TX audio pump started ({Mode})", _quality);
-
         bool isULaw = IsULaw;
         bool is8k = Is8k;
         byte txType = is8k ? TxType8k : TxType16k;
         int txWireBytes = is8k ? TxWireBytes8k : TxWireBytes16k;
         int txPcmAccum = isULaw ? txWireBytes * 2 : txWireBytes;
 
-        var micCh = Channel.CreateBounded<byte[]>(
-            new BoundedChannelOptions(20) { FullMode = BoundedChannelFullMode.DropOldest });
-
-        _waveIn!.DataAvailable += (_, e) =>
-        {
-            if (e.BytesRecorded <= 0)
-                return;
-            var buf = new byte[e.BytesRecorded];
-            Buffer.BlockCopy(e.Buffer, 0, buf, 0, e.BytesRecorded);
-            micCh.Writer.TryWrite(buf);
-        };
-        _waveIn.StartRecording();
-
         byte[] acc = new byte[txPcmAccum];
         byte[] wireBuf = new byte[txWireBytes];
         int fill = 0;
 
-        // Paced by the capture device clock: a frame is sent as soon as a full
-        // frame of mic audio has accumulated. Do NOT pace with a timer — a 10 ms
-        // PeriodicTimer actually ticks at ~64 Hz on Windows (15.6 ms timer
-        // granularity), so the old timer-driven pump under-fed the SCU and
-        // dropped/zero-filled frames, producing periodic clicks on TX audio.
-        try
+        // WaveInEvent raises DataAvailable on its single recording thread, so
+        // the accumulator needs no locking. Partial buffers are carried over.
+        _waveIn!.DataAvailable += (_, e) =>
         {
-            await foreach (var chunk in micCh.Reader.ReadAllAsync(_cts.Token))
+            if (e.BytesRecorded <= 0 || !IsRunning)
+                return;
+            try
             {
                 int offset = 0;
-                while (offset < chunk.Length)
+                while (offset < e.BytesRecorded)
                 {
-                    int copy = Math.Min(chunk.Length - offset, txPcmAccum - fill);
-                    Buffer.BlockCopy(chunk, offset, acc, fill, copy);
+                    int copy = Math.Min(e.BytesRecorded - offset, txPcmAccum - fill);
+                    Buffer.BlockCopy(e.Buffer, offset, acc, fill, copy);
                     offset += copy;
                     fill += copy;
 
@@ -429,17 +422,22 @@ public sealed class AudioChannel : IAsyncDisposable
                     fill = 0;
 
                     byte[] funPayload = BuildTxFunPayload(wireBuf);
-                    _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
-                    _path!.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
+                    var path = _path;
+                    if (path is null)
+                        return;
+                    path.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
+                    path.Send(ZzFrameCodec.BuildFunFrame(txType, _nextSeq(), funPayload));
                     _txFrameSeq++;
                 }
             }
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception ex) { _log.LogError(ex, "TX audio pump error"); }
-
-        _waveIn?.StopRecording();
-        _log.LogDebug("TX audio pump stopped");
+            catch (Exception ex) when (IsRunning)
+            {
+                _log.LogError(ex, "TX audio send error");
+            }
+            catch { }   // socket closed during StopAsync — expected
+        };
+        _waveIn.StartRecording();
+        _log.LogDebug("TX audio started ({Mode})", _quality);
     }
 
     // ── TX FUN payload builder ────────────────────────────────────────────────

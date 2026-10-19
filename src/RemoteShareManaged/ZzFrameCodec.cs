@@ -1041,17 +1041,26 @@ public static class ZzFrameCodec
     //}
 
 
-    // Replace BuildScopeKeepalive in ZzFrameCodec.cs with this version:
-
-    public static byte[] BuildScopeKeepalive(byte seq, byte helloAckNonce)
+    /// <summary>
+    /// Build the steady-state keepalive (FUN 0x0e, MID 0x0107) for one port.
+    /// The Yaesu app sends one per port about once a second — dev 0 on 50000,
+    /// dev 1 on 50001, dev 6 on 50003 — and the SCU acknowledges each (0x0b on
+    /// 50000, MID 0x0187 on 50001/50003). Confirmed from a Yaesu capture 2026-10-19.
+    /// Layout: dev(2) + MID(2) + data_len(2) + SID(4).
+    /// </summary>
+    public static byte[] BuildDeviceKeepalive(byte seq, byte helloAckNonce, ushort dev)
     {
         uint sid = (uint)(helloAckNonce ^ 0x08);
         Span<byte> buf = stackalloc byte[10];
-        BinaryPrimitives_WriteUInt16LE(buf, 0, 0x0006);  // len = 6
-        BinaryPrimitives_WriteUInt16LE(buf, 2, 0x0107);  // MID = 0x0107 (confirmed from Wireshark)
+        BinaryPrimitives_WriteUInt16LE(buf, 0, dev);
+        BinaryPrimitives_WriteUInt16LE(buf, 2, 0x0107);  // MID = 0x0107
         BinaryPrimitives_WriteUInt16LE(buf, 4, 0x0004);  // data_len = 4
         BinaryPrimitives_WriteUInt32LE(buf, 6, sid);
         return BuildFunFrame(0x0E, seq, buf);
     }
+
+    /// <summary>Scope-port (50003) keepalive — <see cref="BuildDeviceKeepalive"/> with dev 6.</summary>
+    public static byte[] BuildScopeKeepalive(byte seq, byte helloAckNonce)
+        => BuildDeviceKeepalive(seq, helloAckNonce, dev: 6);
 
 }
