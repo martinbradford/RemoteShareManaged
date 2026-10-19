@@ -589,7 +589,7 @@ public sealed class ScuSession : IAsyncDisposable
         return new AudioChannel(
             _addr, _helloAckNonce, NextSeq,
             (path, ct) => DoAudioChannelOpenAsync(path, ct, scope),
-            _audioQuality, waveOutDevice, waveInDevice, loggerFactory, _t);
+            _audioQuality, waveOutDevice, waveInDevice, loggerFactory ?? _loggerFactory, _t);
     }
 
     /// <summary>
